@@ -2,8 +2,8 @@ name: Trigger Render Deploy
 
 on:
   schedule:
-    - cron: '40 16 * * *'  # Every day at 5:00 UTC
-  workflow_dispatch:      # Allow manual trigger
+    - cron: '46 15 * * *'  # 16:46 Netherlands time (CET)
+  workflow_dispatch:
 
 jobs:
   trigger:
@@ -12,5 +12,3 @@ jobs:
       - name: Trigger Render Deploy Hook
         run: |
           curl -X POST ${{ secrets.RENDER_DEPLOY_HOOK_URL }}
-        env:
-          RENDER_DEPLOY_HOOK_URL: ${{ secrets.RENDER_DEPLOY_HOOK_URL }}
