@@ -1,3 +1,5 @@
+
+
 const fs = require('fs');
 const path = require('path');
 const { spawn } = require('child_process');
@@ -90,24 +92,31 @@ function runChildProcess(command, args, env) {
   });
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 async function sendScraperReportEmail(status, message = '') {
   const env = { ...process.env, SCRAPER_REPORT_STATUS: status, SCRAPER_REPORT_MESSAGE: message };
 
-  writeLog('Sending scraper report email via npm script...');
-  const npmCode = await runChildProcess('npm', ['run', 'scrape:report:email'], env);
-  if (npmCode === 0) {
+  const nodeExecutable = process.execPath || 'node';
+
+  writeLog(`Sending scraper report email via direct node (${nodeExecutable})...`);
+  const firstCode = await runChildProcess(nodeExecutable, ['scripts/send-scraper-report-email.js'], env);
+  if (firstCode === 0) {
     writeLog('Scraper report email command completed successfully.');
     return true;
   }
 
-  writeLog(`Warning: npm report email command exited with code ${npmCode}; trying node fallback.`);
-  const nodeCode = await runChildProcess('node', ['scripts/send-scraper-report-email.js'], env);
-  if (nodeCode === 0) {
-    writeLog('Scraper report email fallback command completed successfully.');
+  writeLog(`Warning: report email command exited with code ${firstCode}; retrying once in 3s.`);
+  await sleep(3000);
+  const retryCode = await runChildProcess(nodeExecutable, ['scripts/send-scraper-report-email.js'], env);
+  if (retryCode === 0) {
+    writeLog('Scraper report email retry completed successfully.');
     return true;
   }
 
-  writeLog(`Warning: report email fallback script exited with code ${nodeCode}`);
+  writeLog(`Warning: report email retry exited with code ${retryCode}`);
   return false;
 }
 
