@@ -4,8 +4,9 @@
   "description": "Scrape PCS data and insert into Supabase",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js",
-    "scrape:daily:all": "node scraper-update-riders.js && node scraper-update-results-current-year.js && node scraper-update-stage-profiles.js && node scraper-update-uci-points.js"
+    "start": "node scripts/start-server-and-scraper.js",
+    "scrape:daily:all": "node scraper-update-riders.js && node scraper-update-results-current-year.js && node scraper-update-stage-profiles.js && node scraper-update-uci-points.js",
+    "scrape:report:email": "node scripts/send-scraper-report-email.js"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.38.0",
