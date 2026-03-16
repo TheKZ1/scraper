@@ -1,3 +1,5 @@
+
+
 const fs = require('fs');
 const path = require('path');
 const { spawn } = require('child_process');
@@ -73,7 +75,6 @@ async function finishSupabaseRun(runId, status, message = '') {
   }
 }
 
-function runChildProcess(command, args, env) {
 function runChildProcess(command, args, env, { logToConsole = false } = {}) {
   return new Promise((resolve, reject) => {
     const proc = spawn(command, args, {
