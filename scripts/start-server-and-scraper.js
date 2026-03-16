@@ -119,11 +119,24 @@ function sendScraperReportEmail(status, message = '') {
   writeLog('Daily scraper run started');
   writeLog('Running scrapers...');
 
+  writeLog('Starting scraper process...');
   const scraper = spawn('npm', ['run', 'scrape:daily:all'], { shell: true });
-  scraper.stdout.on('data', data => fs.appendFileSync(logPath, data));
-  scraper.stderr.on('data', data => fs.appendFileSync(logPath, data));
+
+  scraper.stdout.on('data', data => {
+    writeLog('[scraper stdout] ' + data.toString());
+    fs.appendFileSync(logPath, data);
+  });
+  scraper.stderr.on('data', data => {
+    writeLog('[scraper stderr] ' + data.toString());
+    fs.appendFileSync(logPath, data);
+  });
+
+  scraper.on('error', err => {
+    writeLog(`[scraper error] ${err.message}`);
+  });
 
   scraper.on('exit', async code => {
+    writeLog(`Scraper process exited with code ${code}`);
     if (code === 0) {
       writeLog('Daily scraper run completed successfully');
       saveRunState(todayKey, 'success', new Date().toISOString());
