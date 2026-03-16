@@ -2,7 +2,7 @@ name: Trigger Render Deploy
 
 on:
   schedule:
-    - cron: '56 15 * * *'  # 16:56 Netherlands time (CET)
+    - cron: '3 4 * * *'  # ~05:03 Netherlands time (CET)
   workflow_dispatch:
 
 jobs:
@@ -10,5 +10,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Trigger Render Deploy Hook
+        env:
+          RENDER_DEPLOY_HOOK_URL: ${{ secrets.RENDER_DEPLOY_HOOK_URL }}
         run: |
-          curl -X POST ${{ secrets.RENDER_DEPLOY_HOOK_URL }}
+          echo "UTC now: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+          echo "Amsterdam now: $(TZ=Europe/Amsterdam date '+%Y-%m-%d %H:%M:%S %Z')"
+
+          curl --fail --show-error --silent -X POST "$RENDER_DEPLOY_HOOK_URL"
+          echo "Render deploy hook triggered"
