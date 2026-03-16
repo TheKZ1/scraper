@@ -2,7 +2,7 @@ name: Trigger Render Deploy
 
 on:
   schedule:
-    - cron: '46 15 * * *'  # 16:46 Netherlands time (CET)
+    - cron: '0 4 * * *'  # 05:00 Netherlands time (CET)
   workflow_dispatch:
 
 jobs:
