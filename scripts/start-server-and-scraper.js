@@ -1,5 +1,3 @@
-
-
 const fs = require('fs');
 const path = require('path');
 const { spawn } = require('child_process');
@@ -106,9 +104,11 @@ function sleep(ms) {
 
 async function sendScraperReportEmail(status, message = '') {
   const env = { ...process.env, SCRAPER_REPORT_STATUS: status, SCRAPER_REPORT_MESSAGE: message };
+  const emailScriptVersion = '2026-03-16-email-v1';
 
   const nodeExecutable = process.execPath || 'node';
 
+  writeLog(`Expecting email script version ${emailScriptVersion}`);
   writeLog(`Sending scraper report email via direct node (${nodeExecutable})...`);
   const firstCode = await runChildProcess(nodeExecutable, ['scripts/send-scraper-report-email.js'], env, { logToConsole: true });
   if (firstCode === 0) {
