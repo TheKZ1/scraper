@@ -2,19 +2,56 @@ name: Trigger Render Deploy
 
 on:
   schedule:
-    - cron: '3 4 * * *'  # ~05:03 Netherlands time (CET)
+    # GitHub cron is UTC. We run both candidate UTC hours and gate by Amsterdam local time.
+    - cron: '3 3 * * *'
+    - cron: '3 4 * * *'
   workflow_dispatch:
 
 jobs:
   trigger:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    concurrency:
+      group: trigger-render-deploy
+      cancel-in-progress: false
+
     steps:
-      - name: Trigger Render Deploy Hook
-        env:
-          RENDER_DEPLOY_HOOK_URL: ${{ secrets.RENDER_DEPLOY_HOOK_URL }}
+      - name: Show current times
         run: |
           echo "UTC now: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
           echo "Amsterdam now: $(TZ=Europe/Amsterdam date '+%Y-%m-%d %H:%M:%S %Z')"
 
-          curl --fail --show-error --silent -X POST "$RENDER_DEPLOY_HOOK_URL"
+      - name: Gate to 05:03 Amsterdam local time
+        id: gate
+        run: |
+          set -euo pipefail
+          AMS_HOUR="$(TZ=Europe/Amsterdam date '+%H')"
+          AMS_MIN="$(TZ=Europe/Amsterdam date '+%M')"
+          if [ "$AMS_HOUR" = "05" ] && [ "$AMS_MIN" = "03" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "Within target local window; continuing."
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "Outside target local window (${AMS_HOUR}:${AMS_MIN}); skipping deploy trigger."
+          fi
+
+      - name: Validate deploy hook secret
+        if: steps.gate.outputs.run == 'true'
+        run: |
+          if [ -z "${{ secrets.RENDER_DEPLOY_HOOK_URL }}" ]; then
+            echo "RENDER_DEPLOY_HOOK_URL secret is missing"
+            exit 1
+          fi
+
+      - name: Trigger Render deploy hook
+        if: steps.gate.outputs.run == 'true'
+        run: |
+          set -euo pipefail
+          HTTP_CODE=$(curl -sS -o /tmp/render_response.txt -w "%{http_code}" -X POST "${{ secrets.RENDER_DEPLOY_HOOK_URL }}")
+          echo "Render hook HTTP status: ${HTTP_CODE}"
+          cat /tmp/render_response.txt || true
+          if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
+            echo "Render deploy hook failed"
+            exit 1
+          fi
           echo "Render deploy hook triggered"
