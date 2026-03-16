@@ -1,0 +1,16 @@
+name: Trigger Render Deploy
+
+on:
+  schedule:
+    - cron: '0 5 * * *'  # Every day at 5:00 UTC
+  workflow_dispatch:      # Allow manual trigger
+
+jobs:
+  trigger:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger Render Deploy Hook
+        run: |
+          curl -X POST ${{ secrets.RENDER_DEPLOY_HOOK_URL }}
+        env:
+          RENDER_DEPLOY_HOOK_URL: ${{ secrets.RENDER_DEPLOY_HOOK_URL }}
