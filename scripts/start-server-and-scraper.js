@@ -1,5 +1,3 @@
-
-
 const fs = require('fs');
 const path = require('path');
 const { spawn } = require('child_process');
@@ -76,6 +74,7 @@ async function finishSupabaseRun(runId, status, message = '') {
 }
 
 function runChildProcess(command, args, env) {
+function runChildProcess(command, args, env, { logToConsole = false } = {}) {
   return new Promise((resolve, reject) => {
     const proc = spawn(command, args, {
       cwd: projectRoot,
@@ -84,8 +83,16 @@ function runChildProcess(command, args, env) {
       stdio: ['ignore', 'pipe', 'pipe'],
     });
 
-    proc.stdout.on('data', data => fs.appendFileSync(logPath, data));
-    proc.stderr.on('data', data => fs.appendFileSync(logPath, data));
+    const handleData = (data) => {
+      fs.appendFileSync(logPath, data);
+      if (logToConsole) {
+        const text = data.toString();
+        text.split('\n').forEach(line => { if (line.trim()) writeLog('[email] ' + line.trimEnd()); });
+      }
+    };
+
+    proc.stdout.on('data', handleData);
+    proc.stderr.on('data', handleData);
 
     proc.on('error', reject);
     proc.on('exit', code => resolve(code));
@@ -102,7 +109,7 @@ async function sendScraperReportEmail(status, message = '') {
   const nodeExecutable = process.execPath || 'node';
 
   writeLog(`Sending scraper report email via direct node (${nodeExecutable})...`);
-  const firstCode = await runChildProcess(nodeExecutable, ['scripts/send-scraper-report-email.js'], env);
+  const firstCode = await runChildProcess(nodeExecutable, ['scripts/send-scraper-report-email.js'], env, { logToConsole: true });
   if (firstCode === 0) {
     writeLog('Scraper report email command completed successfully.');
     return true;
@@ -110,7 +117,7 @@ async function sendScraperReportEmail(status, message = '') {
 
   writeLog(`Warning: report email command exited with code ${firstCode}; retrying once in 3s.`);
   await sleep(3000);
-  const retryCode = await runChildProcess(nodeExecutable, ['scripts/send-scraper-report-email.js'], env);
+  const retryCode = await runChildProcess(nodeExecutable, ['scripts/send-scraper-report-email.js'], env, { logToConsole: true });
   if (retryCode === 0) {
     writeLog('Scraper report email retry completed successfully.');
     return true;
