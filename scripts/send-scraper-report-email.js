@@ -652,6 +652,62 @@ async function sendViaResendIfConfigured(mailPayloads) {
   return true;
 }
 
+function parseFromAddress(fromValue) {
+  const raw = String(fromValue || '').trim();
+  if (!raw) return { email: '', name: '' };
+
+  const match = raw.match(/^([^<]+)<([^>]+)>$/);
+  if (!match) return { email: raw, name: '' };
+
+  return {
+    name: String(match[1] || '').trim().replace(/^"|"$/g, ''),
+    email: String(match[2] || '').trim()
+  };
+}
+
+async function sendViaBrevoIfConfigured(mailPayloads) {
+  const brevoApiKey = String(process.env.BREVO_API_KEY || '').trim();
+  if (!brevoApiKey) return false;
+
+  const overrideFrom = String(process.env.BREVO_FROM || '').trim();
+  console.log('[EMAIL DEBUG] SMTP/Resend unavailable; attempting Brevo HTTPS fallback.');
+
+  for (const payload of mailPayloads) {
+    const senderParsed = parseFromAddress(overrideFrom || payload.from);
+    if (!senderParsed.email) {
+      throw new Error('Brevo fallback requires a valid sender email (set BREVO_FROM or SMTP from).');
+    }
+
+    const body = {
+      sender: {
+        email: senderParsed.email,
+        ...(senderParsed.name ? { name: senderParsed.name } : {})
+      },
+      to: [{ email: String(payload.to || '').trim() }],
+      subject: payload.subject,
+      htmlContent: payload.html || undefined,
+      textContent: payload.text || undefined
+    };
+
+    const response = await fetch('https://api.brevo.com/v3/smtp/email', {
+      method: 'POST',
+      headers: {
+        'api-key': brevoApiKey,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(body)
+    });
+
+    if (!response.ok) {
+      const details = await response.text();
+      throw new Error(`Brevo API error ${response.status}: ${details}`);
+    }
+  }
+
+  console.log(`Scraper report email sent via Brevo to: ${mailPayloads.map(payload => payload.to).join(', ')}`);
+  return true;
+}
+
 function buildTransportConfig(smtp, secureValue) {
   const hostForConnection = smtp.connectHost || smtp.host;
   return {
@@ -2648,18 +2704,13 @@ async function main() {
     pass: smtp && smtp.pass ? '***' : ''
   });
 
-  if (!smtp.host || !smtp.user || !smtp.pass || !smtp.from) {
-    console.log('[EMAIL DEBUG] SMTP not configured (save in Settings or set SCRAPER_SMTP_* env vars); skipping email send.');
-    return;
-  }
-
-  const connectHost = await resolveIpv4Host(smtp.host);
-  const smtpResolved = { ...smtp, connectHost };
+  const hasSmtpConfig = Boolean(smtp.host && smtp.user && smtp.pass && smtp.from);
+  const fallbackFrom = String(process.env.RESEND_FROM || process.env.BREVO_FROM || smtp.from || smtp.user || '').trim();
 
   const mailPayloads = [];
   if (recipients.koenEmail) {
     mailPayloads.push({
-      from: smtp.from,
+      from: fallbackFrom,
       to: recipients.koenEmail,
       subject: `${report.subject} - Koen`,
       text: (report.bodyByPlayer && report.bodyByPlayer[PLAYER_IDS.B]) || report.body,
@@ -2668,13 +2719,32 @@ async function main() {
   }
   if (recipients.oleEmail) {
     mailPayloads.push({
-      from: smtp.from,
+      from: fallbackFrom,
       to: recipients.oleEmail,
       subject: `${report.subject} - Ole`,
       text: (report.bodyByPlayer && report.bodyByPlayer[PLAYER_IDS.A]) || report.body,
       html: (report.htmlByPlayer && report.htmlByPlayer[PLAYER_IDS.A]) || report.html || undefined
     });
   }
+
+  // Prefer Brevo API first (HTTPS) to avoid SMTP egress issues on some hosts.
+  const brevoSentPreferred = await sendViaBrevoIfConfigured(mailPayloads);
+  if (brevoSentPreferred) {
+    console.log('[EMAIL DEBUG] Delivery completed via Brevo preferred path (before SMTP).');
+    return;
+  }
+
+  if (!hasSmtpConfig) {
+    console.log('[EMAIL DEBUG] SMTP not configured; trying HTTPS providers (Brevo/Resend).');
+    const resendSent = await sendViaResendIfConfigured(mailPayloads);
+    if (!resendSent) {
+        console.log('[EMAIL DEBUG] No SMTP or HTTPS provider configured; skipping email send.');
+    }
+    return;
+  }
+
+  const connectHost = await resolveIpv4Host(smtp.host);
+  const smtpResolved = { ...smtp, connectHost };
 
   let smtpFailedError = null;
   try {
@@ -2713,8 +2783,11 @@ async function main() {
   }
 
   if (smtpFailedError) {
-    const resendSent = await sendViaResendIfConfigured(mailPayloads);
-    if (!resendSent) throw smtpFailedError;
+    const brevoSent = await sendViaBrevoIfConfigured(mailPayloads);
+    if (!brevoSent) {
+      const resendSent = await sendViaResendIfConfigured(mailPayloads);
+      if (!resendSent) throw smtpFailedError;
+    }
   }
 
   console.log(`Scraper report email sent to: ${mailPayloads.map(payload => payload.to).join(', ')}`);
