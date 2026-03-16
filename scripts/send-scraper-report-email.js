@@ -617,6 +617,41 @@ function isConnectionError(err) {
   );
 }
 
+async function sendViaResendIfConfigured(mailPayloads) {
+  const resendApiKey = String(process.env.RESEND_API_KEY || '').trim();
+  if (!resendApiKey) return false;
+
+  const overrideFrom = String(process.env.RESEND_FROM || '').trim();
+  console.log('[EMAIL DEBUG] SMTP failed; attempting Resend HTTPS fallback.');
+
+  for (const payload of mailPayloads) {
+    const body = {
+      from: overrideFrom || payload.from,
+      to: [payload.to],
+      subject: payload.subject,
+      html: payload.html || undefined,
+      text: payload.text || undefined
+    };
+
+    const response = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${resendApiKey}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(body)
+    });
+
+    if (!response.ok) {
+      const details = await response.text();
+      throw new Error(`Resend API error ${response.status}: ${details}`);
+    }
+  }
+
+  console.log(`Scraper report email sent via Resend to: ${mailPayloads.map(payload => payload.to).join(', ')}`);
+  return true;
+}
+
 function buildTransportConfig(smtp, secureValue) {
   const hostForConnection = smtp.connectHost || smtp.host;
   return {
@@ -2641,6 +2676,7 @@ async function main() {
     });
   }
 
+  let smtpFailedError = null;
   try {
     const transporter = nodemailer.createTransport(buildTransportConfig(smtpResolved, smtp.secure));
     for (const payload of mailPayloads) {
@@ -2665,11 +2701,20 @@ async function main() {
       `SMTP failed (${err.code || err.message.slice(0, 80)}) with secure=${smtp.secure} port=${smtp.port}; retrying with secure=${fallbackSecure} port=${fallbackPort}.`
     );
 
-    const smtpForFallback = { ...smtpResolved, port: fallbackPort };
-    const fallbackTransporter = nodemailer.createTransport(buildTransportConfig(smtpForFallback, fallbackSecure));
-    for (const payload of mailPayloads) {
-      await fallbackTransporter.sendMail(payload);
+    try {
+      const smtpForFallback = { ...smtpResolved, port: fallbackPort };
+      const fallbackTransporter = nodemailer.createTransport(buildTransportConfig(smtpForFallback, fallbackSecure));
+      for (const payload of mailPayloads) {
+        await fallbackTransporter.sendMail(payload);
+      }
+    } catch (fallbackErr) {
+      smtpFailedError = fallbackErr;
     }
+  }
+
+  if (smtpFailedError) {
+    const resendSent = await sendViaResendIfConfigured(mailPayloads);
+    if (!resendSent) throw smtpFailedError;
   }
 
   console.log(`Scraper report email sent to: ${mailPayloads.map(payload => payload.to).join(', ')}`);
