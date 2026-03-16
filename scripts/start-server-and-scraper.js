@@ -73,32 +73,42 @@ async function finishSupabaseRun(runId, status, message = '') {
   }
 }
 
-function sendScraperReportEmail(status, message = '') {
-  // Try npm script first
-  const npmProc = spawn('npm', ['run', 'scrape:report:email'], {
-    env: { ...process.env, SCRAPER_REPORT_STATUS: status, SCRAPER_REPORT_MESSAGE: message },
-    shell: true,
-    stdio: ['ignore', 'pipe', 'pipe'],
+function runChildProcess(command, args, env) {
+  return new Promise((resolve, reject) => {
+    const proc = spawn(command, args, {
+      cwd: projectRoot,
+      env,
+      shell: true,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    proc.stdout.on('data', data => fs.appendFileSync(logPath, data));
+    proc.stderr.on('data', data => fs.appendFileSync(logPath, data));
+
+    proc.on('error', reject);
+    proc.on('exit', code => resolve(code));
   });
-  npmProc.stdout.on('data', data => fs.appendFileSync(logPath, data));
-  npmProc.stderr.on('data', data => fs.appendFileSync(logPath, data));
-  npmProc.on('exit', code => {
-    if (code !== 0) {
-      writeLog(`Warning: npm report email command exited with code ${code}; trying node fallback.`);
-      const nodeProc = spawn('node', ['scripts/send-scraper-report-email.js'], {
-        env: { ...process.env, SCRAPER_REPORT_STATUS: status, SCRAPER_REPORT_MESSAGE: message },
-        shell: true,
-        stdio: ['ignore', 'pipe', 'pipe'],
-      });
-      nodeProc.stdout.on('data', data => fs.appendFileSync(logPath, data));
-      nodeProc.stderr.on('data', data => fs.appendFileSync(logPath, data));
-      nodeProc.on('exit', nodeCode => {
-        if (nodeCode !== 0) {
-          writeLog(`Warning: report email fallback script exited with code ${nodeCode}`);
-        }
-      });
-    }
-  });
+}
+
+async function sendScraperReportEmail(status, message = '') {
+  const env = { ...process.env, SCRAPER_REPORT_STATUS: status, SCRAPER_REPORT_MESSAGE: message };
+
+  writeLog('Sending scraper report email via npm script...');
+  const npmCode = await runChildProcess('npm', ['run', 'scrape:report:email'], env);
+  if (npmCode === 0) {
+    writeLog('Scraper report email command completed successfully.');
+    return true;
+  }
+
+  writeLog(`Warning: npm report email command exited with code ${npmCode}; trying node fallback.`);
+  const nodeCode = await runChildProcess('node', ['scripts/send-scraper-report-email.js'], env);
+  if (nodeCode === 0) {
+    writeLog('Scraper report email fallback command completed successfully.');
+    return true;
+  }
+
+  writeLog(`Warning: report email fallback script exited with code ${nodeCode}`);
+  return false;
 }
 
 // Main logic
@@ -141,12 +151,20 @@ function sendScraperReportEmail(status, message = '') {
       writeLog('Daily scraper run completed successfully');
       saveRunState(todayKey, 'success', new Date().toISOString());
       await finishSupabaseRun(runId, 'success', 'Completed successfully');
-      sendScraperReportEmail('success', 'Completed successfully');
+      try {
+        await sendScraperReportEmail('success', 'Completed successfully');
+      } catch (err) {
+        writeLog(`Warning: failed to send scraper report email: ${err.message}`);
+      }
     } else {
       writeLog(`ERROR: Scrapers failed with exit code ${code}`);
       saveRunState(todayKey, 'failed', new Date().toISOString());
       await finishSupabaseRun(runId, 'failed', `Scrapers failed with exit code ${code}`);
-      sendScraperReportEmail('failed', `Scrapers failed with exit code ${code}`);
+      try {
+        await sendScraperReportEmail('failed', `Scrapers failed with exit code ${code}`);
+      } catch (err) {
+        writeLog(`Warning: failed to send scraper report email: ${err.message}`);
+      }
       process.exit(1);
     }
   });
