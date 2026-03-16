@@ -1,5 +1,3 @@
-scraper.on('exit', (code) => {
-
 const fs = require('fs');
 const path = require('path');
 const { spawn } = require('child_process');
