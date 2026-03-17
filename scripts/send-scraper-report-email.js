@@ -801,6 +801,34 @@ async function getReportResultsRetentionDaysFromSettings() {
   return Math.max(1, Math.min(14, Math.floor(days)));
 }
 
+async function getStartlistUpcomingRaceCountFromSettings() {
+  const defaultCount = 5;
+
+  const { data, error } = await supabase
+    .from('settings')
+    .select('value')
+    .eq('id', 'scraper_report_startlist_upcoming_race_count')
+    .limit(1);
+
+  if (error) throw error;
+  if (!data || data.length === 0) return defaultCount;
+
+  const rawValue = data[0].value;
+  const parsedValue = parseSettingsJsonValue(rawValue, null);
+
+  let count = defaultCount;
+  if (typeof parsedValue === 'number') {
+    count = parsedValue;
+  } else if (typeof parsedValue === 'string') {
+    count = Number(parsedValue);
+  } else if (parsedValue && typeof parsedValue === 'object' && parsedValue.count !== undefined) {
+    count = Number(parsedValue.count);
+  }
+
+  if (!Number.isFinite(count)) return defaultCount;
+  return Math.max(1, Math.min(20, Math.floor(count)));
+}
+
 function buildDeadlineEvents(races, stages) {
   const raceNameById = new Map((races || []).map(race => [String(race.id), race.name || `Race ${race.id}`]));
   const stagesByRace = new Map();
@@ -1003,6 +1031,7 @@ async function buildReportText() {
   const toTs = parseTimestamp(latest.finished_at);
   const fromTs = previous ? parseTimestamp(previous.finished_at) : null;
   const reportResultsRetentionDays = await getReportResultsRetentionDaysFromSettings();
+  const upcomingRaceCount = await getStartlistUpcomingRaceCountFromSettings();
   const reportResultsRetentionLabel = `${reportResultsRetentionDays} day${reportResultsRetentionDays === 1 ? '' : 's'}`;
 
   const [allRaces, allRiders, allStages, allPredictions, allBreakaways, allRaceClassificationResults] = await Promise.all([
@@ -1050,6 +1079,7 @@ async function buildReportText() {
   const completedResultVisibleStageIds = new Set();
   const stageTimelineByRace = new Map();
   const resultTimelineByRace = new Map();
+  const upcomingRaceCandidates = [];
 
   stagesByRace.forEach((raceStages, raceId) => {
     const activeStages = raceStages
@@ -1093,7 +1123,10 @@ async function buildReportText() {
     const isRecentRace = lastStartTs <= nowTs && (nowTs - lastStartTs) <= oneDayMs;
     const isVisibleForResults = lastStartTs <= nowTs && (nowTs - lastStartTs) <= resultRetentionMs;
 
-    if (firstStartTs > nowTs) futureRaceIds.add(raceId);
+    if (firstStartTs > nowTs) {
+      futureRaceIds.add(raceId);
+      upcomingRaceCandidates.push({ raceId, firstStartTs });
+    }
     if (hasStarted && (hasUpcoming || isRecentRace)) currentRaceIds.add(raceId);
     if (hasStarted && (hasUpcoming || isVisibleForResults)) resultVisibleRaceIds.add(raceId);
     if (hasStarted && hasUpcoming && activeStages.length > 1) currentStageRaceIds.add(raceId);
@@ -1114,32 +1147,87 @@ async function buildReportText() {
     }
   });
 
-  const addedRiders = allRiders.filter((rider) => futureRaceIds.has(String(rider.race_id)) && isInWindow(parseTimestamp(rider.created_at), fromTs, toTs));
-  const addedByRace = new Map();
-  addedRiders.forEach((rider) => {
-    const key = String(rider.race_id);
-    addedByRace.set(key, (addedByRace.get(key) || 0) + 1);
-  });
-
-  const futureRaceRiderSnapshot = allRiders.filter((rider) => futureRaceIds.has(String(rider.race_id)));
-  const futureRaceSnapshotByRace = new Map();
-  futureRaceRiderSnapshot.forEach((rider) => {
-    const key = String(rider.race_id);
-    futureRaceSnapshotByRace.set(key, (futureRaceSnapshotByRace.get(key) || 0) + 1);
-  });
-
   function isRemovedFromStartListStatus(status) {
     const s = String(status || '').toUpperCase();
-    return s.includes('DNS') || s.includes('DNF') || s.includes('WITHDRAW') || s.includes('OUT') || s.includes('SCRATCH') || s.includes('ABANDON');
+    return s.includes('WITHDRAW') || s.includes('OUT') || s.includes('SCRATCH') || s.includes('ABANDON');
   }
 
-  const removedRiders = allRiders.filter((rider) => {
-    if (!futureRaceIds.has(String(rider.race_id))) return false;
-    if (!isRemovedFromStartListStatus(rider.status)) return false;
-    return isInWindow(parseTimestamp(rider.updated_at), fromTs, toTs);
+  const selectedUpcomingRaces = upcomingRaceCandidates
+    .slice()
+    .sort((a, b) => a.firstStartTs - b.firstStartTs)
+    .slice(0, upcomingRaceCount)
+    .map((item) => ({
+      race_id: String(item.raceId),
+      race_name: raceNameById.get(String(item.raceId)) || String(item.raceId),
+      first_start_ts: item.firstStartTs
+    }));
+
+  const selectedUpcomingRaceIds = new Set(selectedUpcomingRaces.map((item) => item.race_id));
+
+  const startlistCountsByRace = new Map();
+  selectedUpcomingRaces.forEach((item) => {
+    startlistCountsByRace.set(item.race_id, 0);
   });
 
-  const removedFutureSnapshot = futureRaceRiderSnapshot.filter((rider) => isRemovedFromStartListStatus(rider.status));
+  allRiders.forEach((rider) => {
+    const raceId = String(rider.race_id);
+    if (!selectedUpcomingRaceIds.has(raceId)) return;
+    if (isRemovedFromStartListStatus(rider.status)) return;
+    startlistCountsByRace.set(raceId, (startlistCountsByRace.get(raceId) || 0) + 1);
+  });
+
+  const startlistOverviewEntries = selectedUpcomingRaces.map((item) => ({
+    race_id: item.race_id,
+    race_name: item.race_name,
+    start_date: formatDisplayDate(formatDateYMD(new Date(item.first_start_ts))),
+    start_time: formatTimeHM(new Date(item.first_start_ts)),
+    rider_count: startlistCountsByRace.get(item.race_id) || 0
+  }));
+
+  const startlistDeltaByRace = new Map();
+  function ensureStartlistDeltaRace(raceId) {
+    if (!startlistDeltaByRace.has(raceId)) {
+      startlistDeltaByRace.set(raceId, { added: 0, removed: 0 });
+    }
+    return startlistDeltaByRace.get(raceId);
+  }
+
+  allRiders.forEach((rider) => {
+    const raceId = String(rider.race_id);
+    if (!selectedUpcomingRaceIds.has(raceId)) return;
+
+    const createdTs = parseTimestamp(rider.created_at);
+    if (isInWindow(createdTs, fromTs, toTs) && !isRemovedFromStartListStatus(rider.status)) {
+      ensureStartlistDeltaRace(raceId).added += 1;
+    }
+
+    const updatedTs = parseTimestamp(rider.updated_at);
+    if (isInWindow(updatedTs, fromTs, toTs) && isRemovedFromStartListStatus(rider.status)) {
+      ensureStartlistDeltaRace(raceId).removed += 1;
+    }
+  });
+
+  const startlistDeltaEntries = selectedUpcomingRaces
+    .map((item) => {
+      const delta = startlistDeltaByRace.get(item.race_id) || { added: 0, removed: 0 };
+      return {
+        race_id: item.race_id,
+        race_name: item.race_name,
+        added: delta.added,
+        removed: delta.removed,
+        net: delta.added - delta.removed
+      };
+    })
+    .filter((item) => item.added !== 0 || item.removed !== 0);
+
+  const removedEntries = allRiders
+    .filter((rider) => selectedUpcomingRaceIds.has(String(rider.race_id)) && isRemovedFromStartListStatus(rider.status))
+    .map((rider) => ({
+      race_id: String(rider.race_id),
+      name: String(rider.name || rider.rider_name || 'Unknown rider'),
+      status: String(rider.status || 'removed'),
+      id: String(rider.id || '')
+    }));
 
   // Exact add/remove detection via rolling snapshot diff.
   let snapshotAddedEntries = [];
@@ -1314,7 +1402,6 @@ async function buildReportText() {
   });
 
   const hasRiderUpdatedAt = allRiders.some((rider) => Boolean(rider.updated_at));
-  const hasRiderCreatedAt = allRiders.some((rider) => Boolean(rider.created_at));
   const hasStageUpdatedAt = allStages.some((stage) => Boolean(stage.updated_at));
 
   const currentRaceDnfDnsSnapshot = allRiders.filter(
@@ -1352,15 +1439,6 @@ async function buildReportText() {
   });
 
   const dnfDnsEntries = Array.from(dnfDnsEntriesMap.values());
-
-  const removedEntries = hasExactSnapshotDiff
-    ? snapshotRemovedEntries.map((entry) => ({
-      race_id: entry.race_id,
-      name: entry.rider_name,
-      status: 'removed',
-      id: entry.rider_id
-    }))
-    : (hasRiderUpdatedAt ? removedRiders : removedFutureSnapshot);
 
   function parseStageOrder(stageLabel) {
     const match = String(stageLabel || '').match(/(\d+)/);
@@ -1989,25 +2067,56 @@ async function buildReportText() {
     return items.map((item, index) => `${index + 1}. (${item.typeLabel}) ${item.dateLabel} ${item.timeLabel} - ${item.countdown} | ${item.details}`);
   };
 
-  const addedRidersEntries = hasExactSnapshotDiff
-    ? snapshotAddedEntries.map((entry) => ({
-      race_id: entry.race_id,
-      name: entry.rider_name,
-      id: entry.rider_id
-    }))
-    : (hasRiderCreatedAt ? addedRiders : futureRaceRiderSnapshot);
-  const groupedAddedRidersText = buildGroupedRidersByRaceText(addedRidersEntries);
-  const groupedRemovedRidersText = buildGroupedRidersByRaceText(removedEntries);
+  function buildStartlistOverviewText(entries) {
+    if (!entries.length) return '';
+    return entries
+      .map((entry) => {
+        const delta = startlistDeltaByRace.get(String(entry.race_id)) || { added: 0, removed: 0 };
+        const net = Number(delta.added || 0) - Number(delta.removed || 0);
+        const deltaLabel = net === 0 ? '' : ` (${net > 0 ? `+${net}` : `${net}`})`;
+        return `- ${entry.race_name} (${entry.start_date} ${entry.start_time}): ${entry.rider_count} riders${deltaLabel}`;
+      })
+      .join('\n');
+  }
 
-  lines.push(hasExactSnapshotDiff
-    ? `Riders added to start lists (future races, exact diff): ${addedRidersEntries.length}`
-    : (hasRiderCreatedAt
-      ? `Riders added to start lists (future races): ${addedRidersEntries.length}`
-      : `Start lists on future races (snapshot): ${addedRidersEntries.length}`));
-  if (!groupedAddedRidersText) {
+  function buildRemovedRidersBySelectedRacesText(racesList, entries) {
+    if (!racesList.length) return '';
+
+    const groupedByRace = new Map();
+    entries.forEach((rider) => {
+      const raceId = String(rider.race_id);
+      if (!groupedByRace.has(raceId)) groupedByRace.set(raceId, []);
+      groupedByRace.get(raceId).push(rider);
+    });
+
+    const lines = [];
+    racesList.forEach((raceEntry) => {
+      const raceId = String(raceEntry.race_id);
+      const ridersInRace = (groupedByRace.get(raceId) || [])
+        .slice()
+        .sort((a, b) => String(a.name || '').localeCompare(String(b.name || '')));
+      lines.push(`- ${raceEntry.race_name}`);
+      if (!ridersInRace.length) {
+        lines.push('  - none');
+        return;
+      }
+      ridersInRace.forEach((rider) => {
+        const statusPart = rider.status ? ` (${rider.status})` : '';
+        lines.push(`  - ${rider.name || 'Unknown rider'}${statusPart}`);
+      });
+    });
+
+    return lines.join('\n');
+  }
+
+  const groupedStartlistOverviewText = buildStartlistOverviewText(startlistOverviewEntries);
+  const groupedRemovedRidersText = buildRemovedRidersBySelectedRacesText(selectedUpcomingRaces, removedEntries);
+
+  lines.push(`Startlist size (next ${upcomingRaceCount} upcoming races): ${startlistOverviewEntries.length} races`);
+  if (!groupedStartlistOverviewText) {
     lines.push('- none');
   } else {
-    lines.push(groupedAddedRidersText);
+    lines.push(groupedStartlistOverviewText);
   }
 
   function formatRacePredictionCell(pick, winner, points) {
@@ -2059,11 +2168,7 @@ async function buildReportText() {
   }
   lines.push('');
 
-  lines.push(hasExactSnapshotDiff
-    ? `Riders removed from start lists (future races, exact diff): ${removedEntries.length}`
-    : (hasRiderUpdatedAt
-      ? `Riders removed from start lists (future races, status-based): ${removedEntries.length}`
-      : `Riders removed from start lists (future races snapshot, status-based): ${removedEntries.length}`));
+  lines.push(`Riders currently removed from start lists (next ${upcomingRaceCount} upcoming races): ${removedEntries.length}`);
   if (!groupedRemovedRidersText) {
     lines.push('- none');
   } else {
@@ -2343,6 +2448,52 @@ async function buildReportText() {
       .join('')}</ul>`;
   }
 
+  function startlistOverviewHtml(entries) {
+    if (!entries || entries.length === 0) return emptyHtml('No upcoming races found.');
+    return `<ul style="${emailStyles.list}">${entries
+      .map((entry) => {
+        const delta = startlistDeltaByRace.get(String(entry.race_id)) || { added: 0, removed: 0 };
+        const net = Number(delta.added || 0) - Number(delta.removed || 0);
+        const netLabel = net > 0 ? `+${net}` : `${net}`;
+        const netHtml = net === 0
+          ? ''
+          : ` <strong style="color:${net > 0 ? '#2e7d32' : '#c62828'}">(${escapeHtml(netLabel)})</strong>`;
+        return `<li><strong>${escapeHtml(entry.race_name)}</strong> (${escapeHtml(entry.start_date)} ${escapeHtml(entry.start_time)}): <strong>${escapeHtml(entry.rider_count)}</strong> riders${netHtml}</li>`;
+      })
+      .join('')}</ul>`;
+  }
+
+  function removedRidersBySelectedRacesHtml(racesList, entries) {
+    if (!racesList || racesList.length === 0) return emptyHtml('No upcoming races found.');
+
+    const groupedByRace = new Map();
+    (entries || []).forEach((rider) => {
+      const raceId = String(rider.race_id || '');
+      if (!groupedByRace.has(raceId)) groupedByRace.set(raceId, []);
+      groupedByRace.get(raceId).push(rider);
+    });
+
+    return `<ul style="${emailStyles.list}">${racesList
+      .map((raceEntry) => {
+        const raceId = String(raceEntry.race_id || '');
+        const ridersInRace = (groupedByRace.get(raceId) || [])
+          .slice()
+          .sort((a, b) => String(a.name || '').localeCompare(String(b.name || '')));
+
+        if (!ridersInRace.length) {
+          return `<li><strong>${escapeHtml(raceEntry.race_name)}</strong><ul style="${emailStyles.list}"><li>none</li></ul></li>`;
+        }
+
+        return `<li><strong>${escapeHtml(raceEntry.race_name)}</strong><ul style="${emailStyles.list}">${ridersInRace
+          .map((rider) => {
+            const statusPart = rider.status ? ` (${escapeHtml(rider.status)})` : '';
+            return `<li>${escapeHtml(rider.name || 'Unknown rider')}${statusPart}</li>`;
+          })
+          .join('')}</ul></li>`;
+      })
+      .join('')}</ul>`;
+  }
+
   function groupedStageStartsHtml(entries) {
     if (!entries || entries.length === 0) return emptyHtml('No stage start-time additions found for this window.');
     const groupedByRace = new Map();
@@ -2595,7 +2746,7 @@ async function buildReportText() {
 
   function buildUpdatesAlertHtml(extraHeaders = []) {
     const headers = [];
-    if (addedRidersEntries.length > 0) headers.push('Riders added to start lists');
+    if (startlistDeltaEntries.length > 0) headers.push('Startlist deltas');
     if (stageStartReportEntries.length > 0) headers.push('Stage start times added');
     if (removedEntries.length > 0) headers.push('Riders removed from start lists');
     if (dnfDnsEntries.length > 0) headers.push('Riders with DNF/DNS');
@@ -2625,9 +2776,9 @@ async function buildReportText() {
         </div>
         ${buildUpdatesAlertHtml(alertExtra)}
         ${deadlinesHtml(`Upcoming deadlines for ${getDisplayNameByPlayerId(playerId)} at scrape time`, deadlines)}
-        ${sectionHtml(hasExactSnapshotDiff ? `Riders added to start lists (future races, exact diff): ${addedRidersEntries.length}` : (hasRiderCreatedAt ? `Riders added to start lists (future races): ${addedRidersEntries.length}` : `Start lists on future races (snapshot): ${addedRidersEntries.length}`), groupedRidersHtml(addedRidersEntries, { emptyMessage: 'No added riders found for this window.' }), addedRidersEntries.length > 0)}
+        ${sectionHtml(`Startlist size (next ${upcomingRaceCount} upcoming races): ${startlistOverviewEntries.length}`, startlistOverviewHtml(startlistOverviewEntries), startlistOverviewEntries.length > 0)}
         ${sectionHtml(hasExactStageStartSnapshotDiff ? `Stage start times added (future/current-stage races, exact diff): ${stageStartReportEntries.length}` : (hasStageUpdatedAt ? `Stage start times added (future/current-stage races, updated window): ${stageStartReportEntries.length}` : `Stage start times snapshot (future/current-stage races): ${stageStartReportEntries.length}`), groupedStageStartsHtml(stageStartReportEntries), stageStartReportEntries.length > 0)}
-        ${sectionHtml(hasExactSnapshotDiff ? `Riders removed from start lists (future races, exact diff): ${removedEntries.length}` : (hasRiderUpdatedAt ? `Riders removed from start lists (future races, status-based): ${removedEntries.length}` : `Riders removed from start lists (future races snapshot, status-based): ${removedEntries.length}`), groupedRidersHtml(removedEntries, { showStatus: true, emptyMessage: 'No removed riders found.' }), removedEntries.length > 0)}
+        ${sectionHtml(`Riders currently removed from start lists (next ${upcomingRaceCount} upcoming races): ${removedEntries.length}`, removedRidersBySelectedRacesHtml(selectedUpcomingRaces, removedEntries), selectedUpcomingRaces.length > 0)}
         ${sectionHtml(hasExactDnfDnsSnapshotDiff ? `Riders with DNF/DNS (current races, includes exact snapshot transitions, max ${reportResultsRetentionLabel} after race end)` : (hasRiderUpdatedAt ? `Riders with DNF/DNS (current races, max ${reportResultsRetentionLabel} after race end)` : `Riders with DNF/DNS (current races snapshot, max ${reportResultsRetentionLabel} after race end)`), groupedDnfDnsHtml(dnfDnsEntries), dnfDnsEntries.length > 0)}
         ${sectionHtml(hasStageUpdatedAt ? `Results updates (current races, completed stages, max ${reportResultsRetentionLabel} after race end)` : `Results snapshot (current races, completed stages, max ${reportResultsRetentionLabel} after race end)`, groupedResultsHtml(scrapedResultEntries), scrapedResultEntries.length > 0)}
         ${sectionHtml(`Breakaway riders (current races, completed stages, max ${reportResultsRetentionLabel} after race end)`, groupedBreakawaysHtml(breakawayEntries), breakawayHasNamesEmail)}
