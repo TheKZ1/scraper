@@ -1,3 +1,5 @@
+
+
 const fs = require('fs');
 const path = require('path');
 const { spawn } = require('child_process');
@@ -102,6 +104,24 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function verifyDailyScraperSources() {
+  const rootScraperPath = path.join(projectRoot, 'scraper-cycling-archives.js');
+  if (!fs.existsSync(rootScraperPath)) {
+    throw new Error(`Missing required file: ${rootScraperPath}`);
+  }
+
+  const rootScraperContent = fs.readFileSync(rootScraperPath, 'utf8');
+  const hasNetworkImport = /from\s+['"]https?:\/\//i.test(rootScraperContent)
+    || /import\s*\(\s*['"]https?:\/\//i.test(rootScraperContent);
+
+  if (hasNetworkImport) {
+    throw new Error(
+      'Invalid root scraper-cycling-archives.js detected: network imports found. ' +
+      'This usually means a Worker file was deployed over the Node scraper file.'
+    );
+  }
+}
+
 async function sendScraperReportEmail(status, message = '') {
   const env = { ...process.env, SCRAPER_REPORT_STATUS: status, SCRAPER_REPORT_MESSAGE: message };
   const emailScriptVersion = '2026-03-16-email-v1';
@@ -146,8 +166,23 @@ async function sendScraperReportEmail(status, message = '') {
   writeLog('Daily scraper run started');
   writeLog('Running scrapers...');
 
+  try {
+    verifyDailyScraperSources();
+    writeLog(`Source preflight OK (projectRoot=${projectRoot})`);
+  } catch (err) {
+    const message = err && err.message ? err.message : String(err);
+    writeLog(`ERROR: Daily scraper source preflight failed: ${message}`);
+    saveRunState(todayKey, 'failed', new Date().toISOString());
+    await finishSupabaseRun(runId, 'failed', `Source preflight failed: ${message}`);
+    process.exit(1);
+  }
+
   writeLog('Starting scraper process...');
-  const scraper = spawn('npm', ['run', 'scrape:daily:all'], { shell: true });
+  const scraper = spawn('npm', ['run', 'scrape:daily:all'], {
+    cwd: projectRoot,
+    env: process.env,
+    shell: true,
+  });
 
   scraper.stdout.on('data', data => {
     writeLog('[scraper stdout] ' + data.toString());
