@@ -5,7 +5,8 @@
   "main": "server.js",
   "scripts": {
     "start": "node scripts/start-server-and-scraper.js",
-    "scrape:daily:all": "node scraper-update-riders.js && node scraper-update-results-current-year.js && node scraper-update-stage-profiles.js && node scraper-update-uci-points.js",
+    "scrape:pcs:schedule": "node scripts/scrape-pcs-start-finish-schedule.js",
+    "scrape:daily:all": "npm run scrape:pcs:schedule && node scraper-update-riders.js && node scraper-update-results-current-year.js && node scraper-update-stage-profiles.js && node scraper-update-uci-points.js",
     "scrape:report:email": "node scripts/send-scraper-report-email.js"
   },
   "dependencies": {
