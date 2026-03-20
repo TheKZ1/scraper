@@ -148,6 +148,93 @@ const buildRequestOptions = (timeout) => {
 const FIRSTCYCLING_BASE_URL = 'https://www.firstcycling.com';
 const DEFAULT_WORLDTOUR_YEAR = 2026;
 const DEFAULT_WORLDTOUR_URL = 'https://firstcycling.com/race.php?y=2026&t=1';
+const EXTRA_INCLUDED_RACE_NAMES = new Set([
+  'world championship itt',
+  'world championship rr',
+]);
+const EXTRA_INCLUDED_RACE_SEARCH_TERMS = [
+  'World Championship ITT',
+  'World Championship RR',
+];
+const EXTRA_INCLUDED_RACE_ID_MAP = {
+  26: 'World Championship RR',
+  27: 'World Championship ITT',
+};
+
+const normalizeRaceNameForIncludeCheck = (value) => String(value || '')
+  .toLowerCase()
+  .normalize('NFD')
+  .replace(/[\u0300-\u036f]/g, '')
+  .replace(/[^a-z0-9\s]/g, ' ')
+  .replace(/\s+/g, ' ')
+  .trim();
+
+const shouldIncludeExtraRace = (value) => {
+  const normalized = normalizeRaceNameForIncludeCheck(value);
+  if (EXTRA_INCLUDED_RACE_NAMES.has(normalized)) {
+    return true;
+  }
+
+  // Be tolerant to common naming variants such as elite/men/women suffixes.
+  return normalized.includes('world championship')
+    && (normalized.includes(' itt') || normalized.includes(' rr'));
+};
+
+const collectExtraFirstCyclingRacesFromSearch = async (year) => {
+  const races = [];
+  const seenUrls = new Set();
+
+  for (const term of EXTRA_INCLUDED_RACE_SEARCH_TERMS) {
+    try {
+      const searchUrl = `https://firstcycling.com/index.php?search=${encodeURIComponent(term)}`;
+      const html = await fetchHtml(searchUrl);
+      const $ = cheerio.load(html);
+
+      $('a[href*="race.php"]').each((idx, link) => {
+        const $link = $(link);
+        const href = String($link.attr('href') || '').trim();
+        const name = String($link.text() || '').trim();
+        if (!href || !name) return;
+        if (!shouldIncludeExtraRace(name)) return;
+
+        const absoluteUrl = buildAbsoluteUrl(href);
+        if (!absoluteUrl || !absoluteUrl.includes('race.php')) return;
+
+        const raceYearMatch = absoluteUrl.match(/[?&]y=(\d{4})/);
+        if (raceYearMatch && Number(raceYearMatch[1]) !== Number(year)) return;
+
+        if (seenUrls.has(absoluteUrl)) return;
+        seenUrls.add(absoluteUrl);
+
+        races.push({
+          name,
+          url: absoluteUrl,
+          year,
+          slug: buildRaceSlugFromUrl(absoluteUrl, name),
+          start_date: null,
+        });
+      });
+    } catch (err) {
+      console.log(`  ⚠️  Could not resolve extra race via search (${term}): ${err.message.split('\n')[0]}`);
+    }
+  }
+
+  return races;
+};
+
+const collectExtraFirstCyclingRacesById = (year) => {
+  return Object.entries(EXTRA_INCLUDED_RACE_ID_MAP).map(([raceId, raceName]) => {
+    const id = Number(raceId);
+    const url = `https://firstcycling.com/race.php?r=${id}&y=${year}`;
+    return {
+      name: raceName,
+      url,
+      year,
+      slug: buildRaceSlugFromUrl(url, raceName),
+      start_date: null,
+    };
+  });
+};
 
 const getTodayUtcDateOnly = () => {
   const now = new Date();
@@ -752,9 +839,10 @@ const fetchFirstCyclingWorldTourRaces = async (year, calendarUrl) => {
   $('table tr').each((idx, row) => {
     const $row = $(row);
     const rowText = $row.text().trim();
+    const rowHasExtraTargetRace = shouldIncludeExtraRace(rowText);
 
-    // Skip rows that don't contain UWT
-    if (!rowText.includes('UWT')) {
+    // Keep UWT rows plus explicitly requested World Championship races.
+    if (!rowText.includes('UWT') && !rowHasExtraTargetRace) {
       return;
     }
 
@@ -789,10 +877,16 @@ const fetchFirstCyclingWorldTourRaces = async (year, calendarUrl) => {
         return;
       }
 
+      const isExtraTargetRace = shouldIncludeExtraRace(name);
+
       // Look for race.php links with r parameter
       if (href.includes('race.php')) {
         const rMatch = href.match(/[?&]r=(\d+)/);
         if (rMatch) {
+          if (!rowText.includes('UWT') && !isExtraTargetRace) {
+            return;
+          }
+
           const url = buildAbsoluteUrl(href);
           if (url && url.includes('race.php')) {
             const slug = buildRaceSlugFromUrl(href, name);
@@ -809,6 +903,21 @@ const fetchFirstCyclingWorldTourRaces = async (year, calendarUrl) => {
         }
       }
     });
+  });
+
+  // Ensure World Championship ITT/RR are still included even when absent from UWT rows.
+  const extraRacesById = collectExtraFirstCyclingRacesById(year);
+  extraRacesById.forEach((race) => {
+    if (!races.has(race.url)) {
+      races.set(race.url, race);
+    }
+  });
+
+  const extraRaces = await collectExtraFirstCyclingRacesFromSearch(year);
+  extraRaces.forEach((race) => {
+    if (!races.has(race.url)) {
+      races.set(race.url, race);
+    }
   });
 
   return Array.from(races.values());
@@ -1459,7 +1568,7 @@ async function insertRaceData(race, raceData, riders) {
             .single();
 
           if (stageData) {
-            const { jpgUrl, pngUrl, chosenUrl } = await resolveStageProfileImageUrls(race, stageToInsert.stage_number, stages.length);
+            const { jpgUrl, pngUrl, chosenUrl } = await resolveStageProfileImageUrls(race, stageToInsert.stage_number, stagesSource.length);
             const stageProfile = {
               stage_id: stageData.id,
               title: stageToInsert.__profile_title || `Stage ${stageToInsert.stage_number}`,
@@ -1578,6 +1687,13 @@ async function main() {
 
   for (let i = 0; i < races.length; i++) {
     const race = races[i];
+    const raceExists = existingRaceMap.has(race.slug);
+
+    if (raceExists) {
+      console.log(`\n⏭️  Skipping ${race.name} (already exists in database)`);
+      continue;
+    }
+
     if (isPastDate(race.start_date)) {
       console.log(`\n⏭️  Skipping ${race.name} (already started: ${race.start_date})`);
       continue;
@@ -1600,25 +1716,6 @@ async function main() {
         stages: [],
         source: 'synthetic',
       };
-    }
-
-    // Check if race already exists
-    const raceExists = existingRaceMap.has(race.slug);
-    
-    if (raceExists) {
-      console.log(`  ℹ️  Race already exists in database`);
-      // Delete riders for this race to refresh the startlist
-      const existingRaceId = existingRaceMap.get(race.slug).id;
-      const { error: deleteError } = await supabase
-        .from('riders')
-        .delete()
-        .eq('race_id', existingRaceId);
-      
-      if (deleteError) {
-        console.log(`  ⚠️  Error clearing riders: ${deleteError.message}`);
-      } else {
-        console.log(`  ✅ Cleared existing riders for refresh`);
-      }
     }
 
     // Insert/update data
