@@ -1143,7 +1143,11 @@ const scrapeFirstCyclingStartlist = async (race) => {
 
   for (const url of startlistUrls) {
     try {
-      const html = await fetchPcsHtml(url);
+      const html = await fetchHtml(url);
+      if (String(html || '').includes('Consent to Cookies') || String(html || '').includes('Toon betting advertenties')) {
+        console.log(`    FirstCycling consent page at ${url}; set FIRSTCYCLING_COOKIE to improve access.`);
+        continue;
+      }
       const $ = cheerio.load(html);
       
       // Check if this looks like a valid page
