@@ -51,6 +51,22 @@ const WORLD_TOUR_URL = getEnvValue(
   'FIRSTCYCLING_WT_URL',
   `https://firstcycling.com/race.php?y=${WORLD_TOUR_YEAR}&t=1`
 );
+const UPDATE_FINISHED_ONE_DAY_RACES = String(
+  getEnvValue('UPDATE_FINISHED_ONE_DAY_RACES', 'true')
+).toLowerCase() === 'true';
+const ONE_DAY_RACE_UPDATE_WINDOW_DAYS = Number(
+  getEnvValue('ONE_DAY_RACE_UPDATE_WINDOW_DAYS', '365')
+);
+
+function getDaysSinceDate(dateStr) {
+  const date = parseDateOnlyUtc(dateStr);
+  if (!date) {
+    return null;
+  }
+
+  const diffMs = getTodayUtcDateOnly().getTime() - date.getTime();
+  return Math.floor(diffMs / (24 * 60 * 60 * 1000));
+}
 
 function normalizeStageTime(value) {
   if (!value) return '';
@@ -351,24 +367,49 @@ async function main() {
       // Check if race is completely finished (for stage races, check if all stages are done)
       const { data: stages } = await supabase
         .from('stages')
-        .select('start_date')
+        .select('start_date,is_rest_day')
         .eq('race_id', existingRace.id)
         .order('start_date', { ascending: false });
 
       let isCompletelyFinished = false;
+      let isOneDayRace = false;
+      let completionDate = race.start_date;
+      const validWindowDays = Number.isFinite(ONE_DAY_RACE_UPDATE_WINDOW_DAYS)
+        ? ONE_DAY_RACE_UPDATE_WINDOW_DAYS
+        : 365;
       
       if (stages && stages.length > 0) {
-        // For stage races: check if the last stage is in the past
-        const lastStageDate = stages[0].start_date;
-        isCompletelyFinished = isPastDate(lastStageDate);
+        const activeStages = stages.filter((stage) => !stage.is_rest_day);
+        isOneDayRace = activeStages.length <= 1;
+
+        // For stage races: use the latest active stage as completion date.
+        const latestActiveStage = activeStages.find((stage) => stage.start_date)
+          || stages.find((stage) => stage.start_date)
+          || null;
+        completionDate = latestActiveStage ? latestActiveStage.start_date : race.start_date;
+        isCompletelyFinished = isPastDate(completionDate);
       } else {
         // For one-day races: check if race start date is in the past
+        isOneDayRace = true;
+        completionDate = race.start_date;
         isCompletelyFinished = isPastDate(race.start_date);
       }
 
-      if (isCompletelyFinished) {
+      const daysSinceCompletion = getDaysSinceDate(completionDate);
+      const allowFinishedOneDayRefresh = UPDATE_FINISHED_ONE_DAY_RACES
+        && isOneDayRace
+        && (daysSinceCompletion === null || daysSinceCompletion <= validWindowDays);
+
+      if (isCompletelyFinished && !allowFinishedOneDayRefresh) {
         console.log(`\n⏭️  Skipping ${race.name} (race finished)`);
         continue;
+      }
+
+      if (isCompletelyFinished && allowFinishedOneDayRefresh) {
+        const daysText = Number.isFinite(daysSinceCompletion)
+          ? `${daysSinceCompletion} day(s) ago`
+          : 'unknown date';
+        console.log(`\nℹ️  ${race.name} finished ${daysText}; refreshing one-day race riders.`);
       }
     }
 
