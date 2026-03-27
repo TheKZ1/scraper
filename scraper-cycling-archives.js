@@ -27,6 +27,13 @@ const hasRiderDnfStageColumns = async () => {
     .limit(1);
   return !error;
 };
+const hasRiderYouthColumn = async () => {
+  const { error } = await supabase
+    .from('riders')
+    .select('id,youth_eligible')
+    .limit(1);
+  return !error;
+};
 const getLatestDnfStageNumberForRace = async (raceId, detectedAtIso) => {
   const { data: stages, error } = await supabase
     .from('stages')
@@ -1313,7 +1320,9 @@ const scrapePcsRiderStatusWithStage = async (race) => {
           ? statusWithStageMatch[1].toUpperCase()
           : (statusOnlyMatch ? statusOnlyMatch[1].toUpperCase() : null);
 
-        if (!detectedStatus) return;
+        const detectedYouthEligible = containerText.includes('*');
+
+        if (!detectedStatus && !detectedYouthEligible) return;
 
         const detectedStageNumber = statusWithStageMatch
           ? Number(statusWithStageMatch[2])
@@ -1333,6 +1342,7 @@ const scrapePcsRiderStatusWithStage = async (race) => {
             name: riderName,
             status: detectedStatus,
             stage_number: Number.isFinite(detectedStageNumber) ? detectedStageNumber : null,
+            youth_eligible: detectedYouthEligible,
             source: 'pcs'
           });
           return;
@@ -1340,8 +1350,11 @@ const scrapePcsRiderStatusWithStage = async (race) => {
 
         if (!Number.isFinite(existing.stage_number) && Number.isFinite(detectedStageNumber)) {
           existing.stage_number = detectedStageNumber;
-          statusByNormalizedName.set(key, existing);
         }
+        if (detectedYouthEligible) {
+          existing.youth_eligible = true;
+        }
+        statusByNormalizedName.set(key, existing);
       });
 
       $('a[href*="rider/"]').each((idx, link) => {
@@ -1362,7 +1375,9 @@ const scrapePcsRiderStatusWithStage = async (race) => {
           ? statusWithStageMatch[1].toUpperCase()
           : (statusOnlyMatch ? statusOnlyMatch[1].toUpperCase() : null);
 
-        if (!detectedStatus) return;
+        const detectedYouthEligible = contextText.includes('*');
+
+        if (!detectedStatus && !detectedYouthEligible) return;
 
         const detectedStageNumber = statusWithStageMatch
           ? Number(statusWithStageMatch[2])
@@ -1377,6 +1392,7 @@ const scrapePcsRiderStatusWithStage = async (race) => {
             name: riderName,
             status: detectedStatus,
             stage_number: Number.isFinite(detectedStageNumber) ? detectedStageNumber : null,
+            youth_eligible: detectedYouthEligible,
             source: 'pcs'
           });
           return;
@@ -1384,8 +1400,11 @@ const scrapePcsRiderStatusWithStage = async (race) => {
 
         if (!Number.isFinite(existing.stage_number) && Number.isFinite(detectedStageNumber)) {
           existing.stage_number = detectedStageNumber;
-          statusByNormalizedName.set(key, existing);
         }
+        if (detectedYouthEligible) {
+          existing.youth_eligible = true;
+        }
+        statusByNormalizedName.set(key, existing);
       });
 
       if (statusByNormalizedName.size > 0) {
@@ -1618,6 +1637,7 @@ async function insertRaceData(race, raceData, riders) {
     const pcsRiderStatusByName = await scrapePcsRiderStatusWithStage(race);
     console.log(`  Found ${pcsRiderStatusByName.size} riders with PCS DNF/DNS status`);
     const riderDnfStageColumnsSupported = await hasRiderDnfStageColumns();
+    const riderYouthColumnSupported = await hasRiderYouthColumn();
     const scrapeDetectedAt = new Date().toISOString();
     const latestDnfStageNumber = riderDnfStageColumnsSupported
       ? await getLatestDnfStageNumberForRace(raceId, scrapeDetectedAt)
@@ -1643,6 +1663,9 @@ async function insertRaceData(race, raceData, riders) {
           const pcsStageNumber = Number(pcsEntry && pcsEntry.stage_number);
           insertRow.dnf_stage_number = Number.isFinite(pcsStageNumber) ? pcsStageNumber : latestDnfStageNumber;
           insertRow.dnf_detected_at = scrapeDetectedAt;
+        }
+        if (riderYouthColumnSupported) {
+          insertRow.youth_eligible = !!(pcsEntry && pcsEntry.youth_eligible);
         }
         return insertRow;
       });
