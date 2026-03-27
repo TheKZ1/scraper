@@ -105,6 +105,15 @@ async function hasRiderDnfStageColumns() {
   return !error;
 }
 
+async function hasRiderYouthColumn() {
+  const { error } = await supabase
+    .from('riders')
+    .select('id,youth_eligible')
+    .limit(1);
+
+  return !error;
+}
+
 async function getLatestDnfStageNumberForRace(raceId, detectedAtIso) {
   const { data: stages, error } = await supabase
     .from('stages')
@@ -159,6 +168,7 @@ async function updateRidersForRace(race, raceRecord) {
 
   const scrapeDetectedAt = new Date().toISOString();
   const riderDnfStageColumnsSupported = await hasRiderDnfStageColumns();
+  const riderYouthColumnSupported = await hasRiderYouthColumn();
   const latestDnfStageNumber = riderDnfStageColumnsSupported
     ? await getLatestDnfStageNumberForRace(raceRecord.id, scrapeDetectedAt)
     : null;
@@ -190,11 +200,12 @@ async function updateRidersForRace(race, raceRecord) {
 
   const scrapedRiders = ridersWithUrls;
 
+  const existingRidersSelect = riderDnfStageColumnsSupported
+    ? 'id, name, status, dnf_stage_number, dnf_detected_at'
+    : 'id, name, status';
   const { data: existingRiders, error: existingRidersError } = await supabase
     .from('riders')
-    .select(riderDnfStageColumnsSupported
-      ? 'id, name, status, dnf_stage_number, dnf_detected_at'
-      : 'id, name, status')
+    .select(existingRidersSelect)
     .eq('race_id', raceRecord.id);
 
   if (existingRidersError) {
@@ -236,6 +247,8 @@ async function updateRidersForRace(race, raceRecord) {
         : scrapeDetectedAt)
       : null;
 
+    const youthEligible = !!(pcsEntry && pcsEntry.youth_eligible);
+
     if (existingRider) {
       const updateRow = {
         id: existingRider.id,
@@ -249,6 +262,9 @@ async function updateRidersForRace(race, raceRecord) {
       if (riderDnfStageColumnsSupported) {
         updateRow.dnf_stage_number = dnfStageNumber;
         updateRow.dnf_detected_at = dnfDetectedAt;
+      }
+      if (riderYouthColumnSupported) {
+        updateRow.youth_eligible = youthEligible;
       }
 
       ridersToUpdate.push(updateRow);
@@ -265,6 +281,9 @@ async function updateRidersForRace(race, raceRecord) {
       if (riderDnfStageColumnsSupported) {
         insertRow.dnf_stage_number = dnfStageNumber;
         insertRow.dnf_detected_at = dnfDetectedAt;
+      }
+      if (riderYouthColumnSupported) {
+        insertRow.youth_eligible = youthEligible;
       }
 
       ridersToInsert.push(insertRow);
