@@ -624,8 +624,32 @@ const buildAbsoluteUrl = (href) => {
   return `${FIRSTCYCLING_BASE_URL}/${href}`;
 };
 
+const fetchWithRetry = async (fetchFn, url, maxRetries = 3) => {
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      return await fetchFn();
+    } catch (err) {
+      const status = err.response?.status;
+      const isRetryable = !err.response || status >= 500; // Retry on network errors or 5xx
+      const isLastAttempt = attempt === maxRetries;
+
+      if (isRetryable && !isLastAttempt) {
+        const delay = Math.pow(2, attempt - 1) * 1000; // Exponential backoff: 1s, 2s, 4s
+        console.log(`  ⚠️  Attempt ${attempt}/${maxRetries} failed (${status || 'network error'}), retrying in ${delay}ms...`);
+        await sleep(delay);
+        continue;
+      }
+
+      throw err;
+    }
+  }
+};
+
 const fetchHtml = async (url) => {
-  const res = await axios.get(url, buildRequestOptions(15000));
+  const res = await fetchWithRetry(
+    () => axios.get(url, buildRequestOptions(15000)),
+    url
+  );
   return res.data;
 };
 
@@ -634,7 +658,10 @@ const fetchPcsHtml = async (url) => {
     headers: pcsHeaders,
     timeout: 15000,
   };
-  const res = await axios.get(url, options);
+  const res = await fetchWithRetry(
+    () => axios.get(url, options),
+    url
+  );
   return res.data;
 };
 
