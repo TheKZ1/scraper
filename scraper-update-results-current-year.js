@@ -266,9 +266,243 @@ function buildRaceBaseUrl(raceNumber) {
   return `https://firstcycling.com/race.php?r=${raceNumber}&y=${TARGET_YEAR}`;
 }
 
+function appendQueryParam(url, key, value) {
+  try {
+    const parsed = new URL(url);
+    parsed.searchParams.set(key, value);
+    return parsed.toString();
+  } catch (err) {
+    return url;
+  }
+}
+
+function uniqueUrls(urls) {
+  const seen = new Set();
+  const out = [];
+  for (const url of urls || []) {
+    const clean = String(url || '').trim();
+    if (!clean || seen.has(clean)) continue;
+    seen.add(clean);
+    out.push(clean);
+  }
+  return out;
+}
+
 async function fetchHtml(url) {
   const response = await axios.get(url, buildRequestOptions(20000));
   return response.data;
+}
+
+function extractLastRiderFromTable(html) {
+  const $ = cheerio.load(html);
+
+  for (const table of $('table').toArray()) {
+    const $table = $(table);
+    const rows = $table.find('tbody tr').length ? $table.find('tbody tr') : $table.find('tr');
+    const rankedRiders = [];
+
+    for (const row of rows.toArray()) {
+      const $row = $(row);
+      if (!isRankedResultRow($row)) continue;
+      const rider = extractRiderNameFromRow($row);
+      if (rider) rankedRiders.push(rider);
+    }
+
+    if (rankedRiders.length > 0) {
+      return rankedRiders[rankedRiders.length - 1];
+    }
+  }
+
+  return null;
+}
+
+function extractRankedRidersByTable(html) {
+  const $ = cheerio.load(html);
+  const rankedTables = [];
+
+  for (const table of $('table').toArray()) {
+    const $table = $(table);
+    const rows = $table.find('tbody tr').length ? $table.find('tbody tr') : $table.find('tr');
+    const riders = [];
+
+    for (const row of rows.toArray()) {
+      const $row = $(row);
+      if (!isRankedResultRow($row)) continue;
+      const rider = extractRiderNameFromRow($row);
+      if (rider) riders.push(rider);
+    }
+
+    if (riders.length > 0) {
+      rankedTables.push(riders);
+    }
+  }
+
+  return rankedTables;
+}
+
+async function scrapeRaceClassificationResults(raceNumber, _widgetBaseUrl, isOneDayRace) {
+  if (!raceNumber) {
+    return {
+      GC_WINNER: null,
+      POINTS_WINNER: null,
+      MOUNTAIN_WINNER: null,
+      YOUTH_WINNER: null,
+      LOWEST_GC_FINISHER: null,
+      sourceUrls: {
+        GC_WINNER: null,
+        POINTS_WINNER: null,
+        MOUNTAIN_WINNER: null,
+        YOUTH_WINNER: null,
+        LOWEST_GC_FINISHER: null,
+      }
+    };
+  }
+
+  const sourceUrl = buildRaceBaseUrl(raceNumber);
+  let html = '';
+  try {
+    html = await fetchHtml(sourceUrl);
+  } catch (err) {
+    return {
+      GC_WINNER: null,
+      POINTS_WINNER: null,
+      MOUNTAIN_WINNER: null,
+      YOUTH_WINNER: null,
+      LOWEST_GC_FINISHER: null,
+      sourceUrls: {
+        GC_WINNER: sourceUrl,
+        POINTS_WINNER: sourceUrl,
+        MOUNTAIN_WINNER: sourceUrl,
+        YOUTH_WINNER: sourceUrl,
+        LOWEST_GC_FINISHER: sourceUrl,
+      }
+    };
+  }
+
+  const rankedTables = extractRankedRidersByTable(html);
+  const gcTable = rankedTables[0] || [];
+  const youthTable = rankedTables[1] || [];
+  const pointsTable = rankedTables[2] || [];
+  const mountainTable = rankedTables[3] || [];
+
+  const results = {
+    GC_WINNER: gcTable[0] || null,
+    POINTS_WINNER: null,
+    MOUNTAIN_WINNER: null,
+    YOUTH_WINNER: null,
+    LOWEST_GC_FINISHER: gcTable.length > 0 ? gcTable[gcTable.length - 1] : null,
+    sourceUrls: {
+      GC_WINNER: sourceUrl,
+      POINTS_WINNER: sourceUrl,
+      MOUNTAIN_WINNER: sourceUrl,
+      YOUTH_WINNER: sourceUrl,
+      LOWEST_GC_FINISHER: sourceUrl,
+    }
+  };
+
+  if (!isOneDayRace) {
+    results.YOUTH_WINNER = youthTable[0] || null;
+    results.POINTS_WINNER = pointsTable[0] || null;
+    results.MOUNTAIN_WINNER = mountainTable[0] || null;
+  }
+
+  return results;
+}
+
+const REQUIRED_ONE_DAY_RESULT_TYPES = ['GC_WINNER'];
+const REQUIRED_STAGE_RACE_RESULT_TYPES = ['GC_WINNER', 'POINTS_WINNER', 'MOUNTAIN_WINNER', 'YOUTH_WINNER', 'LOWEST_GC_FINISHER'];
+const CATEGORY_LABEL_BY_RESULT_TYPE = {
+  GC_WINNER: 'GC',
+  POINTS_WINNER: 'Sprint',
+  MOUNTAIN_WINNER: 'KOM',
+  YOUTH_WINNER: 'Pogi Trui',
+  LOWEST_GC_FINISHER: 'Rode Lantaarn',
+};
+
+function getRequiredResultTypes(isOneDayRace) {
+  return isOneDayRace ? REQUIRED_ONE_DAY_RESULT_TYPES : REQUIRED_STAGE_RACE_RESULT_TYPES;
+}
+
+function hasStoredClassificationResult(classificationByRaceId, raceId, resultType) {
+  const byType = classificationByRaceId.get(String(raceId));
+  if (!byType) return false;
+  return Boolean(String(byType[resultType] || '').trim());
+}
+
+function hasAllClassificationResults(classificationByRaceId, raceId, isOneDayRace) {
+  const required = getRequiredResultTypes(isOneDayRace);
+  return required.every((resultType) => hasStoredClassificationResult(classificationByRaceId, raceId, resultType));
+}
+
+async function loadRaceClassificationByRaceId() {
+  const { data, error } = await supabase
+    .from('race_classification_results')
+    .select('race_id,result_type,rider_name,source')
+    .eq('source', 'firstcycling_widget');
+
+  if (error) {
+    console.warn(`⚠️  Could not load race_classification_results: ${error.message}`);
+    return new Map();
+  }
+
+  const byRace = new Map();
+  for (const row of data || []) {
+    const raceId = String(row && row.race_id || '').trim();
+    const resultType = String(row && row.result_type || '').trim();
+    const riderName = String(row && row.rider_name || '').trim();
+    if (!raceId || !resultType || !riderName) continue;
+    if (!byRace.has(raceId)) byRace.set(raceId, {});
+    const byType = byRace.get(raceId);
+    if (!byType[resultType]) byType[resultType] = riderName;
+  }
+
+  return byRace;
+}
+
+async function upsertRaceClassificationResult(raceId, resultType, riderName, classificationByRaceId) {
+  const cleanName = normalizeName(riderName);
+  if (!cleanName) return false;
+  if (DRY_RUN) return false;
+  const categoryLabel = CATEGORY_LABEL_BY_RESULT_TYPE[resultType] || resultType;
+
+  const { data: existingRows, error: existingError } = await supabase
+    .from('race_classification_results')
+    .select('id,rider_name')
+    .eq('race_id', raceId)
+    .eq('result_type', resultType)
+    .eq('source', 'firstcycling_widget')
+    .limit(1);
+
+  if (existingError) throw existingError;
+
+  const existing = (existingRows || [])[0] || null;
+  if (existing) {
+    const existingName = normalizeCompareName(existing.rider_name);
+    const nextName = normalizeCompareName(cleanName);
+    if (existingName !== nextName) {
+      const { error: updateError } = await supabase
+        .from('race_classification_results')
+        .update({ rider_name: cleanName, category_label: categoryLabel })
+        .eq('id', existing.id);
+      if (updateError) throw updateError;
+    }
+  } else {
+    const { error: insertError } = await supabase
+      .from('race_classification_results')
+      .insert([{
+        race_id: raceId,
+        result_type: resultType,
+        category_label: categoryLabel,
+        rider_name: cleanName,
+        source: 'firstcycling_widget',
+      }]);
+    if (insertError) throw insertError;
+  }
+
+  const raceKey = String(raceId);
+  if (!classificationByRaceId.has(raceKey)) classificationByRaceId.set(raceKey, {});
+  classificationByRaceId.get(raceKey)[resultType] = cleanName;
+  return true;
 }
 
 async function scrapeStageWinner(stage, raceNumber, widgetBaseUrl, scrapedStageNumber) {
@@ -383,6 +617,7 @@ async function main() {
   }
 
   const { races, stagesByRace } = await loadRacesAndStages();
+  const classificationByRaceId = await loadRaceClassificationByRaceId();
   const todayUtc = getTodayUtcDateOnly();
 
   if (!races.length) {
@@ -392,6 +627,7 @@ async function main() {
 
   let updatedStages = 0;
   let updatedRaces = 0;
+  let updatedRaceClassifications = 0;
 
   for (let raceIndex = 0; raceIndex < races.length; raceIndex++) {
     const race = races[raceIndex];
@@ -408,11 +644,6 @@ async function main() {
       continue;
     }
 
-    if (!FORCE && race.full_results) {
-      console.log(`\n⏭️  [${raceIndex + 1}/${races.length}] ${race.name}: full_results=true, skipped`);
-      continue;
-    }
-
     if (!hasRaceStarted(raceStages, todayUtc)) {
       console.log(`\n⏭️  [${raceIndex + 1}/${races.length}] ${race.name}: race has not started yet, skipped`);
       continue;
@@ -421,6 +652,12 @@ async function main() {
     const nonRestStages = raceStages.filter(stage => !stage.is_rest_day);
     const startedStages = nonRestStages.filter(stage => hasStageStarted(stage, todayUtc));
     const isOneDayRace = nonRestStages.length <= 1;
+    const hasClassifications = hasAllClassificationResults(classificationByRaceId, race.id, isOneDayRace);
+
+    if (!FORCE && race.full_results && hasClassifications) {
+      console.log(`\n⏭️  [${raceIndex + 1}/${races.length}] ${race.name}: full_results + classifications already present, skipped`);
+      continue;
+    }
 
     if (!startedStages.length) {
       console.log(`\n⏭️  [${raceIndex + 1}/${races.length}] ${race.name}: no started stages yet, skipped`);
@@ -489,12 +726,42 @@ async function main() {
       console.log(`  Race result: stage race, winner skipped | full_results=${allStageWinnersKnown}`);
     }
 
+    const raceIsFinished = Boolean(allStageWinnersKnown);
+    const classificationsAlreadyStored = hasAllClassificationResults(classificationByRaceId, race.id, isOneDayRace);
+    if (raceIsFinished && (!classificationsAlreadyStored || FORCE)) {
+      const classificationResults = await scrapeRaceClassificationResults(raceNumber, raceWidgetBaseUrl, isOneDayRace);
+      const requiredTypes = getRequiredResultTypes(isOneDayRace);
+      for (const resultType of requiredTypes) {
+        const winner = classificationResults[resultType] || null;
+        if (!winner) continue;
+        const changed = await upsertRaceClassificationResult(
+          race.id,
+          resultType,
+          winner,
+          classificationByRaceId
+        );
+        if (changed) {
+          updatedRaceClassifications += 1;
+        }
+      }
+
+      const summary = requiredTypes
+        .map((resultType) => `${resultType}=${classificationResults[resultType] || 'not found'}`)
+        .join(' | ');
+      console.log(`  Race classifications: ${summary}`);
+    } else if (!raceIsFinished) {
+      console.log('  Race classifications: skipped (race not fully finished yet)');
+    } else {
+      console.log('  Race classifications: already present, skipped');
+    }
+
     await sleep(400);
   }
 
   console.log('\n✅ Daily current-year results scraping finished.');
   console.log(`   Updated stages: ${updatedStages}`);
   console.log(`   Updated races: ${updatedRaces}`);
+  console.log(`   Updated race classifications: ${updatedRaceClassifications}`);
 }
 
 if (require.main === module) {
