@@ -1,6 +1,6 @@
 const axios = require('axios');
 const cheerio = require('cheerio');
-const { supabase } = require('./scraper-cycling-archives');
+const { supabase, resolvePcsRaceSlug } = require('./scraper-cycling-archives');
 
 const TARGET_YEAR = Number(process.env.RESULTS_YEAR || String(new Date().getFullYear()));
 const DRY_RUN = String(process.env.DRY_RUN || '') === '1';
@@ -85,7 +85,7 @@ const toggleFirstCyclingHost = (url) => {
   return input;
 };
 
-const firstCyclingCookie = process.env.FIRSTCYCLING_COOKIE;
+const firstCyclingCookie = 'KU819ojPaRYw95HZeHl_48sR2WrDdhQe_mS4tw7fl0s-1775023953-1.2.1.1-36bEbSpg_6Fcp0Kf0raEA2A8oTiv9GaKyISBdy.1wXMFZ2PkIR3iGVSz4UnM37QY5G9HSiWXhWTu5av9O69TskqjbRjwW3t_HyWitIjWUJ1iQSEbYkgqwN7i5jySZQb6lF4fnOjIDhR0lj0fMzNhqlGaTXmFEZ8XtRbVlaIo_MEZDCaZYRNjPkMpGv0n1lAVuVFc6J8_kr7Pv0.xldKKHEbkpKIH0mWshi2OnDSXtimtcopQdd0F0x5gEJ0ggJyl';
 if (firstCyclingCookie && firstCyclingCookie.trim()) {
   headers.Cookie = firstCyclingCookie.trim();
 }
@@ -386,7 +386,213 @@ function extractRankedRidersByTable(html) {
   return rankedTables;
 }
 
-async function scrapeRaceClassificationResults(raceNumber, _widgetBaseUrl, isOneDayRace) {
+const pcsHeaders = {
+  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+  'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+  'Accept-Language': 'en-US,en;q=0.5',
+  'Connection': 'keep-alive',
+};
+
+async function fetchPcsHtml(url) {
+  try {
+    const response = await axios.get(url, {
+      headers: pcsHeaders,
+      timeout: 15000,
+    });
+    return response.data;
+  } catch (err) {
+    throw err;
+  }
+}
+
+function extractRiderNameFromPcsRow($row) {
+  const riderLink = $row.find('a[href*="/rider/"]').first();
+  if (!riderLink.length) return null;
+  return normalizeName(riderLink.text());
+}
+
+function extractRankedRidersFromPcsTable(html) {
+  const $ = cheerio.load(html);
+  const riders = [];
+
+  for (const table of $('table').toArray()) {
+    const $table = $(table);
+    const rows = $table.find('tbody tr').length ? $table.find('tbody tr') : $table.find('tr');
+
+    for (const row of rows.toArray()) {
+      const $row = $(row);
+      if (!isRankedResultRow($row)) continue;
+      const rider = extractRiderNameFromPcsRow($row);
+      if (rider) riders.push(rider);
+    }
+
+    if (riders.length > 0) break; // Use first table with ranked riders
+  }
+
+  return riders;
+}
+
+async function scrapePcsRaceClassificationResults(race, isOneDayRace) {
+  if (!race || !race.id) {
+    return {
+      GC_WINNER: null,
+      POINTS_WINNER: null,
+      MOUNTAIN_WINNER: null,
+      YOUTH_WINNER: null,
+      LOWEST_GC_FINISHER: null,
+      sourceUrls: {
+        GC_WINNER: null,
+        POINTS_WINNER: null,
+        MOUNTAIN_WINNER: null,
+        YOUTH_WINNER: null,
+        LOWEST_GC_FINISHER: null,
+      }
+    };
+  }
+
+  const slug = await resolvePcsRaceSlug(race);
+  const year = Number(race.year || TARGET_YEAR);
+  if (!slug || !Number.isFinite(year)) {
+    return {
+      GC_WINNER: null,
+      POINTS_WINNER: null,
+      MOUNTAIN_WINNER: null,
+      YOUTH_WINNER: null,
+      LOWEST_GC_FINISHER: null,
+      sourceUrls: {
+        GC_WINNER: null,
+        POINTS_WINNER: null,
+        MOUNTAIN_WINNER: null,
+        YOUTH_WINNER: null,
+        LOWEST_GC_FINISHER: null,
+      }
+    };
+  }
+
+  const baseUrl = `https://www.procyclingstats.com/race/${slug}/${year}`;
+  const resultUrls = [
+    `${baseUrl}/results`,
+    `${baseUrl}/results/gc`, // GC results
+  ];
+
+  const results = {
+    GC_WINNER: null,
+    POINTS_WINNER: null,
+    MOUNTAIN_WINNER: null,
+    YOUTH_WINNER: null,
+    LOWEST_GC_FINISHER: null,
+    sourceUrls: {
+      GC_WINNER: null,
+      POINTS_WINNER: null,
+      MOUNTAIN_WINNER: null,
+      YOUTH_WINNER: null,
+      LOWEST_GC_FINISHER: null,
+    }
+  };
+
+  let gcRiders = [];
+  for (const url of resultUrls) {
+    try {
+      const html = await fetchPcsHtml(url);
+      gcRiders = extractRankedRidersFromPcsTable(html);
+      if (gcRiders.length > 0) {
+        results.GC_WINNER = gcRiders[0] || null;
+        results.LOWEST_GC_FINISHER = gcRiders.length > 0 ? gcRiders[gcRiders.length - 1] : null;
+        results.sourceUrls.GC_WINNER = url;
+        results.sourceUrls.LOWEST_GC_FINISHER = url;
+        break;
+      }
+    } catch (err) {
+      // Try next URL
+    }
+  }
+
+  if (!isOneDayRace && gcRiders.length > 0) {
+    const pointsUrl = `${baseUrl}/results/points`;
+    const mountainUrl = `${baseUrl}/results/mountain`;
+    const youthUrl = `${baseUrl}/results/youth`;
+
+    try {
+      const pointsHtml = await fetchPcsHtml(pointsUrl);
+      const pointsRiders = extractRankedRidersFromPcsTable(pointsHtml);
+      if (pointsRiders.length > 0) {
+        results.POINTS_WINNER = pointsRiders[0];
+        results.sourceUrls.POINTS_WINNER = pointsUrl;
+      }
+    } catch (err) {
+      // Continue without points winner
+    }
+
+    try {
+      const mountainHtml = await fetchPcsHtml(mountainUrl);
+      const mountainRiders = extractRankedRidersFromPcsTable(mountainHtml);
+      if (mountainRiders.length > 0) {
+        results.MOUNTAIN_WINNER = mountainRiders[0];
+        results.sourceUrls.MOUNTAIN_WINNER = mountainUrl;
+      }
+    } catch (err) {
+      // Continue without mountain winner
+    }
+
+    try {
+      const youthHtml = await fetchPcsHtml(youthUrl);
+      const youthRiders = extractRankedRidersFromPcsTable(youthHtml);
+      if (youthRiders.length > 0) {
+        results.YOUTH_WINNER = youthRiders[0];
+        results.sourceUrls.YOUTH_WINNER = youthUrl;
+      }
+    } catch (err) {
+      // Continue without youth winner
+    }
+  }
+
+  return results;
+}
+
+async function scrapePcsStageWinner(race, stageNumber) {
+  if (!race || !race.id || !Number.isFinite(Number(stageNumber))) {
+    return { winner: null, sourceUrl: null };
+  }
+
+  const slug = await resolvePcsRaceSlug(race);
+  const year = Number(race.year || TARGET_YEAR);
+  const stage = Number(stageNumber);
+  if (!slug || !Number.isFinite(year)) {
+    return { winner: null, sourceUrl: null };
+  }
+
+  const url = `https://www.procyclingstats.com/race/${slug}/${year}/stage-${stage}`;
+  try {
+    const html = await fetchPcsHtml(url);
+    const winner = extractFirstRiderFromTable(html);
+    return { winner: winner || null, sourceUrl: url };
+  } catch (err) {
+    return { winner: null, sourceUrl: url };
+  }
+}
+
+async function scrapePcsOneDayRaceWinner(race) {
+  if (!race || !race.id) {
+    return { winner: null, sourceUrl: null };
+  }
+
+  const slug = await resolvePcsRaceSlug(race);
+  const year = Number(race.year || TARGET_YEAR);
+  if (!slug || !Number.isFinite(year)) {
+    return { winner: null, sourceUrl: null };
+  }
+
+  const url = `https://www.procyclingstats.com/race/${slug}/${year}`;
+  try {
+    const html = await fetchPcsHtml(url);
+    const winner = extractFirstRiderFromTable(html);
+    return { winner: winner || null, sourceUrl: url };
+  } catch (err) {
+    return { winner: null, sourceUrl: url };
+  }
+}
+
+async function scrapeRaceClassificationResults(raceNumber, _widgetBaseUrl, isOneDayRace, race = null) {
   if (!raceNumber) {
     return {
       GC_WINNER: null,
@@ -409,6 +615,20 @@ async function scrapeRaceClassificationResults(raceNumber, _widgetBaseUrl, isOne
   try {
     html = await fetchHtml(sourceUrl);
   } catch (err) {
+    // FirstCycling fetch failed, try PCS fallback
+    if (race && race.id) {
+      try {
+        console.log(`    ℹ️  FirstCycling unavailable, trying PCS...`);
+        const pcsResults = await scrapePcsRaceClassificationResults(race, isOneDayRace);
+        if (pcsResults.GC_WINNER) {
+          console.log(`    ✓ Scraped GC winner from PCS`);
+          return pcsResults;
+        }
+      } catch (pcsErr) {
+        // PCS fallback also failed
+      }
+    }
+    
     return {
       GC_WINNER: null,
       POINTS_WINNER: null,
@@ -551,7 +771,7 @@ async function upsertRaceClassificationResult(raceId, resultType, riderName, cla
   return true;
 }
 
-async function scrapeStageWinner(stage, raceNumber, widgetBaseUrl, scrapedStageNumber) {
+async function scrapeStageWinner(stage, raceNumber, widgetBaseUrl, scrapedStageNumber, race = null) {
   const preferredWidgetUrl = buildStageWidgetUrlFromBase(widgetBaseUrl, scrapedStageNumber);
   const widgetCandidates = [
     preferredWidgetUrl,
@@ -571,18 +791,38 @@ async function scrapeStageWinner(stage, raceNumber, widgetBaseUrl, scrapedStageN
     }
   }
 
+  // Fall back to PCS stage pages when FirstCycling is unavailable.
+  if (race && race.id) {
+    const pcsResult = await scrapePcsStageWinner(race, stage.stage_number);
+    if (pcsResult.winner) {
+      return pcsResult;
+    }
+  }
+
   return { winner: null, sourceUrl: preferredWidgetUrl || null };
 }
 
-async function scrapeOneDayRaceWinner(raceNumber) {
+async function scrapeOneDayRaceWinner(raceNumber, race = null) {
   if (!raceNumber) return { winner: null, sourceUrl: null };
 
   const url = buildRaceBaseUrl(raceNumber);
   try {
     const html = await fetchHtml(url);
     const winner = extractFirstRiderFromTable(html);
+    if (!winner && race && race.id) {
+      const pcsResult = await scrapePcsOneDayRaceWinner(race);
+      if (pcsResult.winner) {
+        return pcsResult;
+      }
+    }
     return { winner: winner || null, sourceUrl: url };
   } catch (err) {
+    if (race && race.id) {
+      const pcsResult = await scrapePcsOneDayRaceWinner(race);
+      if (pcsResult.winner) {
+        return pcsResult;
+      }
+    }
     return { winner: null, sourceUrl: url };
   }
 }
@@ -732,7 +972,7 @@ async function main() {
     let fallbackRaceWinner = null;
     for (const stage of startedStages) {
       const scrapedStageNumber = Math.max(0, Number(stage.stage_number) + stageNumberOffset);
-      const { winner, sourceUrl } = await scrapeStageWinner(stage, raceNumber, raceWidgetBaseUrl, scrapedStageNumber);
+      const { winner, sourceUrl } = await scrapeStageWinner(stage, raceNumber, raceWidgetBaseUrl, scrapedStageNumber, race);
       const existingWinner = normalizeCompareName(stage.winner);
       const scrapedWinner = normalizeCompareName(winner);
 
@@ -761,7 +1001,7 @@ async function main() {
       });
 
     if (isOneDayRace) {
-      const oneDay = await scrapeOneDayRaceWinner(raceNumber);
+      const oneDay = await scrapeOneDayRaceWinner(raceNumber, race);
       const raceWinner = oneDay.winner || fallbackRaceWinner || null;
       await updateRaceResult(race.id, raceWinner, Boolean(raceWinner));
       updatedRaces += 1;
@@ -775,7 +1015,7 @@ async function main() {
     const raceIsFinished = Boolean(allStageWinnersKnown);
     const classificationsAlreadyStored = hasAllClassificationResults(classificationByRaceId, race.id, isOneDayRace);
     if (raceIsFinished && (!classificationsAlreadyStored || FORCE)) {
-      const classificationResults = await scrapeRaceClassificationResults(raceNumber, raceWidgetBaseUrl, isOneDayRace);
+      const classificationResults = await scrapeRaceClassificationResults(raceNumber, raceWidgetBaseUrl, isOneDayRace, race);
       const requiredTypes = getRequiredResultTypes(isOneDayRace);
       for (const resultType of requiredTypes) {
         const winner = classificationResults[resultType] || null;
