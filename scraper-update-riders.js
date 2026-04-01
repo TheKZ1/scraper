@@ -1,6 +1,5 @@
 const {
-  fetchFirstCyclingWorldTourRaces,
-  scrapeFirstCyclingStartlist,
+  scrapePcsStartlist,
   scrapePcsRiderStatusWithStage,
   supabase,
 } = require('./scraper-cycling-archives');
@@ -157,7 +156,7 @@ async function getLatestDnfStageNumberForRace(raceId, detectedAtIso) {
 async function updateRidersForRace(race, raceRecord) {
   console.log(`\n🚴 Updating riders for ${raceRecord.name}...`);
 
-  const riders = await scrapeFirstCyclingStartlist(race);
+  const riders = await scrapePcsStartlist(race);
   if (!riders || riders.length === 0) {
     console.log('  ⚠️  No riders scraped; skipping update to avoid wiping existing data');
     return;
@@ -343,7 +342,7 @@ async function updateRidersForRace(race, raceRecord) {
 
 async function main() {
   console.log('🚀 Starting riders-only update...');
-  console.log(`📍 Fetching UWT races for ${WORLD_TOUR_YEAR}...`);
+  console.log(`📍 Loading UWT races for ${WORLD_TOUR_YEAR} from database...`);
 
   // Check if we should update all races (including past ones)
   const { data: settingsData, error: settingsError } = await supabase
@@ -355,31 +354,25 @@ async function main() {
   const updateAllRaces = settingsData && settingsData.value === true;
   console.log(`📋 Update all races setting: ${updateAllRaces}`);
 
-  const races = await fetchFirstCyclingWorldTourRaces(WORLD_TOUR_YEAR, WORLD_TOUR_URL);
-  if (races.length === 0) {
-    console.log('❌ No UWT races found. Check FIRSTCYCLING_COOKIE or calendar URL.');
-    process.exit(1);
-  }
-
   const { data: existingRaces, error: existingRacesError } = await supabase
     .from('races')
-    .select('id, slug, name');
+    .select('id, slug, name, year')
+    .eq('year', WORLD_TOUR_YEAR);
 
   if (existingRacesError) {
     console.log(`❌ Failed to load existing races: ${existingRacesError.message}`);
     process.exit(1);
   }
 
-  const existingRaceMap = new Map((existingRaces || []).map(race => [race.slug, race]));
+  const races = existingRaces || [];
+  if (races.length === 0) {
+    console.log('⚠️  No races found in database for this year — skipping rider updates.');
+    return;
+  }
 
   for (let i = 0; i < races.length; i++) {
     const race = races[i];
-    const existingRace = existingRaceMap.get(race.slug);
-
-    if (!existingRace) {
-      console.log(`\n⏭️  Skipping ${race.name} (not in database)`);
-      continue;
-    }
+    const existingRace = race;
 
     // Only skip completed races if updateAllRaces is false
     if (!updateAllRaces) {
