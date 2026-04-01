@@ -592,8 +592,8 @@ async function scrapePcsOneDayRaceWinner(race) {
   }
 }
 
-async function scrapeRaceClassificationResults(raceNumber, _widgetBaseUrl, isOneDayRace, race = null) {
-  if (!raceNumber) {
+async function scrapeRaceClassificationResults(isOneDayRace, race = null) {
+  if (!race || !race.id) {
     return {
       GC_WINNER: null,
       POINTS_WINNER: null,
@@ -610,69 +610,28 @@ async function scrapeRaceClassificationResults(raceNumber, _widgetBaseUrl, isOne
     };
   }
 
-  const sourceUrl = buildRaceBaseUrl(raceNumber);
-  let html = '';
   try {
-    html = await fetchHtml(sourceUrl);
-  } catch (err) {
-    // FirstCycling fetch failed, try PCS fallback
-    if (race && race.id) {
-      try {
-        console.log(`    ℹ️  FirstCycling unavailable, trying PCS...`);
-        const pcsResults = await scrapePcsRaceClassificationResults(race, isOneDayRace);
-        if (pcsResults.GC_WINNER) {
-          console.log(`    ✓ Scraped GC winner from PCS`);
-          return pcsResults;
-        }
-      } catch (pcsErr) {
-        // PCS fallback also failed
-      }
+    const pcsResults = await scrapePcsRaceClassificationResults(race, isOneDayRace);
+    if (pcsResults.GC_WINNER) {
+      return pcsResults;
     }
-    
-    return {
+  } catch (pcsErr) {
+  }
+
+  return {
+    GC_WINNER: null,
+    POINTS_WINNER: null,
+    MOUNTAIN_WINNER: null,
+    YOUTH_WINNER: null,
+    LOWEST_GC_FINISHER: null,
+    sourceUrls: {
       GC_WINNER: null,
       POINTS_WINNER: null,
       MOUNTAIN_WINNER: null,
       YOUTH_WINNER: null,
       LOWEST_GC_FINISHER: null,
-      sourceUrls: {
-        GC_WINNER: sourceUrl,
-        POINTS_WINNER: sourceUrl,
-        MOUNTAIN_WINNER: sourceUrl,
-        YOUTH_WINNER: sourceUrl,
-        LOWEST_GC_FINISHER: sourceUrl,
-      }
-    };
-  }
-
-  const rankedTables = extractRankedRidersByTable(html);
-  const gcTable = rankedTables[0] || [];
-  const youthTable = rankedTables[1] || [];
-  const pointsTable = rankedTables[2] || [];
-  const mountainTable = rankedTables[3] || [];
-
-  const results = {
-    GC_WINNER: gcTable[0] || null,
-    POINTS_WINNER: null,
-    MOUNTAIN_WINNER: null,
-    YOUTH_WINNER: null,
-    LOWEST_GC_FINISHER: gcTable.length > 0 ? gcTable[gcTable.length - 1] : null,
-    sourceUrls: {
-      GC_WINNER: sourceUrl,
-      POINTS_WINNER: sourceUrl,
-      MOUNTAIN_WINNER: sourceUrl,
-      YOUTH_WINNER: sourceUrl,
-      LOWEST_GC_FINISHER: sourceUrl,
     }
   };
-
-  if (!isOneDayRace) {
-    results.YOUTH_WINNER = youthTable[0] || null;
-    results.POINTS_WINNER = pointsTable[0] || null;
-    results.MOUNTAIN_WINNER = mountainTable[0] || null;
-  }
-
-  return results;
 }
 
 const REQUIRED_ONE_DAY_RESULT_TYPES = ['GC_WINNER'];
@@ -771,60 +730,41 @@ async function upsertRaceClassificationResult(raceId, resultType, riderName, cla
   return true;
 }
 
-async function scrapeStageWinner(stage, raceNumber, widgetBaseUrl, scrapedStageNumber, race = null) {
-  const preferredWidgetUrl = buildStageWidgetUrlFromBase(widgetBaseUrl, scrapedStageNumber);
-  const widgetCandidates = [
-    preferredWidgetUrl,
-    raceNumber ? buildWidgetUrl(raceNumber, scrapedStageNumber) : null,
-  ].filter(Boolean);
-
-  for (const widgetUrl of widgetCandidates) {
-    try {
-      const widgetHtml = await fetchHtml(widgetUrl);
-      const winner = isTeamResultTable(widgetHtml)
-        ? extractFirstTeamFromTable(widgetHtml)
-        : extractFirstRiderFromTable(widgetHtml);
-      if (winner) {
-        return { winner, sourceUrl: widgetUrl };
-      }
-    } catch (err) {
-    }
+async function scrapeStageWinner(stage, scrapedStageNumber, race = null) {
+  if (!race || !race.id) {
+    return { winner: null, sourceUrl: null };
   }
 
-  // Fall back to PCS stage pages when FirstCycling is unavailable.
-  if (race && race.id) {
-    const pcsResult = await scrapePcsStageWinner(race, stage.stage_number);
-    if (pcsResult.winner) {
-      return pcsResult;
-    }
+  const pcsResult = await scrapePcsStageWinner(race, scrapedStageNumber);
+  if (pcsResult.winner) {
+    return pcsResult;
   }
 
-  return { winner: null, sourceUrl: preferredWidgetUrl || null };
+  return { winner: null, sourceUrl: pcsResult.sourceUrl || null };
 }
 
-async function scrapeOneDayRaceWinner(raceNumber, race = null) {
-  if (!raceNumber) return { winner: null, sourceUrl: null };
+async function scrapeOneDayRaceWinner(race = null) {
+  if (!race || !race.id) return { winner: null, sourceUrl: null };
+  const pcsResult = await scrapePcsOneDayRaceWinner(race);
+  return { winner: pcsResult.winner || null, sourceUrl: pcsResult.sourceUrl || null };
+}
 
-  const url = buildRaceBaseUrl(raceNumber);
-  try {
-    const html = await fetchHtml(url);
-    const winner = extractFirstRiderFromTable(html);
-    if (!winner && race && race.id) {
-      const pcsResult = await scrapePcsOneDayRaceWinner(race);
-      if (pcsResult.winner) {
-        return pcsResult;
-      }
-    }
-    return { winner: winner || null, sourceUrl: url };
-  } catch (err) {
-    if (race && race.id) {
-      const pcsResult = await scrapePcsOneDayRaceWinner(race);
-      if (pcsResult.winner) {
-        return pcsResult;
-      }
-    }
-    return { winner: null, sourceUrl: url };
+async function detectPcsStageNumberOffset(nonRestStages, race) {
+  if (!Array.isArray(nonRestStages) || nonRestStages.length < 2 || !race || !race.id) {
+    return 0;
   }
+
+  const sorted = nonRestStages
+    .slice()
+    .sort((a, b) => Number(a.stage_number) - Number(b.stage_number));
+
+  const firstStage = sorted[0];
+  if (!firstStage || Number(firstStage.stage_number) !== 1) {
+    return 0;
+  }
+
+  const stageZero = await scrapePcsStageWinner(race, 0);
+  return stageZero && stageZero.winner ? -1 : 0;
 }
 
 async function loadRacesAndStages() {
@@ -955,16 +895,7 @@ async function main() {
     console.log(`Stages: ${nonRestStages.length} | started stages: ${startedStages.length} | one-day: ${isOneDayRace}`);
     console.log(`${'='.repeat(60)}`);
 
-    const raceWidgetBaseUrl = normalizeWidgetBaseUrl(race[RACE_WIDGET_COLUMN]);
-    const raceNumber = extractRaceNumberFromUrl(raceWidgetBaseUrl)
-      || (race.firstcycling_race_number ? String(race.firstcycling_race_number) : null);
-
-    if (!raceNumber) {
-      console.log('  ⚠️  Could not resolve FirstCycling race number, skipping race');
-      continue;
-    }
-
-    const stageNumberOffset = await detectStageNumberOffset(nonRestStages, raceNumber, raceWidgetBaseUrl);
+    const stageNumberOffset = await detectPcsStageNumberOffset(nonRestStages, race);
     if (stageNumberOffset !== 0) {
       console.log('  Prologue mapping detected: stage 0 -> stage 1 (offset -1)');
     }
@@ -972,7 +903,7 @@ async function main() {
     let fallbackRaceWinner = null;
     for (const stage of startedStages) {
       const scrapedStageNumber = Math.max(0, Number(stage.stage_number) + stageNumberOffset);
-      const { winner, sourceUrl } = await scrapeStageWinner(stage, raceNumber, raceWidgetBaseUrl, scrapedStageNumber, race);
+      const { winner, sourceUrl } = await scrapeStageWinner(stage, scrapedStageNumber, race);
       const existingWinner = normalizeCompareName(stage.winner);
       const scrapedWinner = normalizeCompareName(winner);
 
@@ -1001,7 +932,7 @@ async function main() {
       });
 
     if (isOneDayRace) {
-      const oneDay = await scrapeOneDayRaceWinner(raceNumber, race);
+      const oneDay = await scrapeOneDayRaceWinner(race);
       const raceWinner = oneDay.winner || fallbackRaceWinner || null;
       await updateRaceResult(race.id, raceWinner, Boolean(raceWinner));
       updatedRaces += 1;
@@ -1015,7 +946,7 @@ async function main() {
     const raceIsFinished = Boolean(allStageWinnersKnown);
     const classificationsAlreadyStored = hasAllClassificationResults(classificationByRaceId, race.id, isOneDayRace);
     if (raceIsFinished && (!classificationsAlreadyStored || FORCE)) {
-      const classificationResults = await scrapeRaceClassificationResults(raceNumber, raceWidgetBaseUrl, isOneDayRace, race);
+      const classificationResults = await scrapeRaceClassificationResults(isOneDayRace, race);
       const requiredTypes = getRequiredResultTypes(isOneDayRace);
       for (const resultType of requiredTypes) {
         const winner = classificationResults[resultType] || null;
