@@ -60,12 +60,29 @@ const parseAxiosProxy = (proxyUrl) => {
 
 const firstCyclingAxiosProxy = parseAxiosProxy(firstCyclingProxyUrl);
 
-const buildRequestOptions = (timeout) => {
+const buildRequestOptions = (timeout, config = {}) => {
   const options = { headers, timeout };
-  if (firstCyclingAxiosProxy) {
+  if (firstCyclingAxiosProxy && !config.disableProxy) {
     options.proxy = firstCyclingAxiosProxy;
   }
   return options;
+};
+
+const toggleFirstCyclingHost = (url) => {
+  const input = String(url || '').trim();
+  if (!input.includes('firstcycling.com')) {
+    return input;
+  }
+
+  if (input.includes('://www.firstcycling.com')) {
+    return input.replace('://www.firstcycling.com', '://firstcycling.com');
+  }
+
+  if (input.includes('://firstcycling.com')) {
+    return input.replace('://firstcycling.com', '://www.firstcycling.com');
+  }
+
+  return input;
 };
 
 const firstCyclingCookie = process.env.FIRSTCYCLING_COOKIE;
@@ -289,8 +306,37 @@ function uniqueUrls(urls) {
 }
 
 async function fetchHtml(url) {
-  const response = await axios.get(url, buildRequestOptions(20000));
-  return response.data;
+  try {
+    const response = await axios.get(url, buildRequestOptions(20000));
+    return response.data;
+  } catch (err) {
+    const status = Number(err && err.response && err.response.status);
+    const isFirstCycling = String(url || '').includes('firstcycling.com');
+    if (status !== 403 || !isFirstCycling) {
+      throw err;
+    }
+
+    const hostVariantUrl = toggleFirstCyclingHost(url);
+    const fallbackCandidates = [url, hostVariantUrl]
+      .map((value) => String(value || '').trim())
+      .filter((value, idx, arr) => value && arr.indexOf(value) === idx);
+
+    for (const candidateUrl of fallbackCandidates) {
+      try {
+        const fallbackResponse = await axios.get(candidateUrl, buildRequestOptions(20000, { disableProxy: true }));
+        if (candidateUrl !== url) {
+          console.log(`  ℹ️  FirstCycling 403 recovered via host fallback: ${candidateUrl}`);
+        } else {
+          console.log('  ℹ️  FirstCycling 403 recovered by bypassing configured proxy.');
+        }
+        return fallbackResponse.data;
+      } catch (fallbackErr) {
+        // Try next fallback candidate.
+      }
+    }
+
+    throw err;
+  }
 }
 
 function extractLastRiderFromTable(html) {
