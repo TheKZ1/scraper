@@ -104,6 +104,19 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function summarizeIssuesForMessage(issueLines, maxLines = 8, maxChars = 1800) {
+  const lines = Array.isArray(issueLines) ? issueLines.filter(Boolean) : [];
+  if (!lines.length) return '';
+
+  const kept = lines.slice(0, maxLines);
+  const summary = kept.map((line, idx) => `${idx + 1}. ${line}`).join('\n');
+  if (summary.length <= maxChars) {
+    return summary;
+  }
+
+  return summary.slice(0, maxChars - 3) + '...';
+}
+
 function verifyDailyScraperSources() {
   const rootScraperPath = path.join(projectRoot, 'scraper-cycling-archives.js');
   if (!fs.existsSync(rootScraperPath)) {
@@ -178,6 +191,35 @@ async function sendScraperReportEmail(status, message = '') {
   }
 
   writeLog('Starting scraper process...');
+  const scraperIssueLines = [];
+  const scraperIssueSet = new Set();
+  const issueRegex = /\b(error|fatal|exception|unhandled|axioserror)\b/i;
+
+  const pushScraperIssue = (label, rawLine) => {
+    const line = String(rawLine || '').replace(/\s+/g, ' ').trim();
+    if (!line) return;
+
+    const entry = `${label}: ${line}`;
+    const key = entry.toLowerCase();
+    if (scraperIssueSet.has(key)) return;
+
+    scraperIssueSet.add(key);
+    scraperIssueLines.push(entry);
+  };
+
+  const collectIssuesFromChunk = (label, chunk, collectAllLines = false) => {
+    const text = String(chunk || '');
+    text
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .forEach((line) => {
+        if (collectAllLines || issueRegex.test(line)) {
+          pushScraperIssue(label, line);
+        }
+      });
+  };
+
   const scraper = spawn('npm', ['run', 'scrape:daily:all'], {
     cwd: projectRoot,
     env: process.env,
@@ -187,33 +229,50 @@ async function sendScraperReportEmail(status, message = '') {
   scraper.stdout.on('data', data => {
     writeLog('[scraper stdout] ' + data.toString());
     fs.appendFileSync(logPath, data);
+    collectIssuesFromChunk('stdout', data, false);
   });
   scraper.stderr.on('data', data => {
     writeLog('[scraper stderr] ' + data.toString());
     fs.appendFileSync(logPath, data);
+    collectIssuesFromChunk('stderr', data, true);
   });
 
   scraper.on('error', err => {
     writeLog(`[scraper error] ${err.message}`);
+    pushScraperIssue('process', err && err.message ? err.message : String(err));
   });
 
   scraper.on('exit', async code => {
     writeLog(`Scraper process exited with code ${code}`);
+    const issuesSummary = summarizeIssuesForMessage(scraperIssueLines);
+
     if (code === 0) {
+      const hasIssues = scraperIssueLines.length > 0;
+      const successMessage = hasIssues
+        ? `Completed with issues detected during scrape:\n${issuesSummary}`
+        : 'Completed successfully';
+
+      if (hasIssues) {
+        writeLog(`Warning: scraper finished with ${scraperIssueLines.length} issue line(s) detected; including summary in report.`);
+      }
+
       writeLog('Daily scraper run completed successfully');
       saveRunState(todayKey, 'success', new Date().toISOString());
-      await finishSupabaseRun(runId, 'success', 'Completed successfully');
+      await finishSupabaseRun(runId, 'success', successMessage);
       try {
-        await sendScraperReportEmail('success', 'Completed successfully');
+        await sendScraperReportEmail('success', successMessage);
       } catch (err) {
         writeLog(`Warning: failed to send scraper report email: ${err.message}`);
       }
     } else {
       writeLog(`ERROR: Scrapers failed with exit code ${code}`);
+      const failureMessage = issuesSummary
+        ? `Scrapers failed with exit code ${code}. Error summary:\n${issuesSummary}`
+        : `Scrapers failed with exit code ${code}`;
       saveRunState(todayKey, 'failed', new Date().toISOString());
-      await finishSupabaseRun(runId, 'failed', `Scrapers failed with exit code ${code}`);
+      await finishSupabaseRun(runId, 'failed', failureMessage);
       try {
-        await sendScraperReportEmail('failed', `Scrapers failed with exit code ${code}`);
+        await sendScraperReportEmail('failed', failureMessage);
       } catch (err) {
         writeLog(`Warning: failed to send scraper report email: ${err.message}`);
       }
