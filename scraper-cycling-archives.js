@@ -144,12 +144,29 @@ const parseAxiosProxy = (proxyUrl) => {
 
 const firstCyclingAxiosProxy = parseAxiosProxy(firstCyclingProxyUrl);
 
-const buildRequestOptions = (timeout) => {
+const buildRequestOptions = (timeout, config = {}) => {
   const options = { headers, timeout };
-  if (firstCyclingAxiosProxy) {
+  if (firstCyclingAxiosProxy && !config.disableProxy) {
     options.proxy = firstCyclingAxiosProxy;
   }
   return options;
+};
+
+const toggleFirstCyclingHost = (url) => {
+  const input = String(url || '').trim();
+  if (!input.includes('firstcycling.com')) {
+    return input;
+  }
+
+  if (input.includes('://www.firstcycling.com')) {
+    return input.replace('://www.firstcycling.com', '://firstcycling.com');
+  }
+
+  if (input.includes('://firstcycling.com')) {
+    return input.replace('://firstcycling.com', '://www.firstcycling.com');
+  }
+
+  return input;
 };
 
 const FIRSTCYCLING_BASE_URL = 'https://www.firstcycling.com';
@@ -646,11 +663,45 @@ const fetchWithRetry = async (fetchFn, url, maxRetries = 3) => {
 };
 
 const fetchHtml = async (url) => {
-  const res = await fetchWithRetry(
-    () => axios.get(url, buildRequestOptions(15000)),
-    url
-  );
-  return res.data;
+  try {
+    const res = await fetchWithRetry(
+      () => axios.get(url, buildRequestOptions(15000)),
+      url
+    );
+    return res.data;
+  } catch (err) {
+    const status = Number(err && err.response && err.response.status);
+    const isFirstCycling = String(url || '').includes('firstcycling.com');
+
+    if (status !== 403 || !isFirstCycling) {
+      throw err;
+    }
+
+    const hostVariantUrl = toggleFirstCyclingHost(url);
+    const fallbackCandidates = [url, hostVariantUrl]
+      .map((value) => String(value || '').trim())
+      .filter((value, idx, arr) => value && arr.indexOf(value) === idx);
+
+    for (const candidateUrl of fallbackCandidates) {
+      try {
+        const fallbackRes = await fetchWithRetry(
+          () => axios.get(candidateUrl, buildRequestOptions(20000, { disableProxy: true })),
+          candidateUrl,
+          2
+        );
+        if (candidateUrl !== url) {
+          console.log(`  ℹ️  FirstCycling 403 recovered via host fallback: ${candidateUrl}`);
+        } else {
+          console.log('  ℹ️  FirstCycling 403 recovered by bypassing configured proxy.');
+        }
+        return fallbackRes.data;
+      } catch (fallbackErr) {
+        // Try next fallback candidate.
+      }
+    }
+
+    throw err;
+  }
 };
 
 const fetchPcsHtml = async (url) => {
@@ -862,7 +913,17 @@ const scrapeFirstCyclingStageImageFromStagePage = async (stageUrl) => {
 };
 
 const fetchFirstCyclingWorldTourRaces = async (year, calendarUrl) => {
-  const html = await fetchHtml(calendarUrl);
+  let html = '';
+  try {
+    html = await fetchHtml(calendarUrl);
+  } catch (err) {
+    const status = Number(err && err.response && err.response.status);
+    if (status === 403) {
+      console.log('❌ FirstCycling returned 403 for the WorldTour calendar. Set FIRSTCYCLING_COOKIE and/or disable FIRSTCYCLING_PROXY_URL.');
+      return [];
+    }
+    throw err;
+  }
   if (html.includes('Consent to Cookies') || html.includes('Toon betting advertenties')) {
     console.log('❌ FirstCycling returned the consent page. Set FIRSTCYCLING_COOKIE and try again.');
     return [];
