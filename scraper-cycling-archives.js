@@ -100,7 +100,6 @@ const pcsHeaders = {
   'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
   'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
   'Accept-Language': 'en-US,en;q=0.5',
-  'Referer': 'https://www.procyclingstats.com/',
   'Connection': 'keep-alive',
 };
 
@@ -294,7 +293,7 @@ const isPastDate = (dateStr) => {
   return date < getTodayUtcDateOnly();
 };
 
-const firstCyclingCookie = getEnvValue('FIRSTCYCLING_COOKIE', '');
+const firstCyclingCookie = 'KU819ojPaRYw95HZeHl_48sR2WrDdhQe_mS4tw7fl0s-1775023953-1.2.1.1-36bEbSpg_6Fcp0Kf0raEA2A8oTiv9GaKyISBdy.1wXMFZ2PkIR3iGVSz4UnM37QY5G9HSiWXhWTu5av9O69TskqjbRjwW3t_HyWitIjWUJ1iQSEbYkgqwN7i5jySZQb6lF4fnOjIDhR0lj0fMzNhqlGaTXmFEZ8XtRbVlaIo_MEZDCaZYRNjPkMpGv0n1lAVuVFc6J8_kr7Pv0.xldKKHEbkpKIH0mWshi2OnDSXtimtcopQdd0F0x5gEJ0ggJyl';
 if (firstCyclingCookie) {
   headers.Cookie = firstCyclingCookie;
 }
@@ -1220,6 +1219,82 @@ async function scrapeFirstCyclingRace(race) {
   }
 }
 
+const scrapePcsStartlist = async (race) => {
+  const slug = await resolvePcsRaceSlug(race);
+  const year = Number(race && race.year);
+  if (!slug || !Number.isFinite(year)) {
+    return [];
+  }
+
+  const startlistUrls = [
+    `https://www.procyclingstats.com/race/${slug}/${year}/startlist`,
+    `https://www.procyclingstats.com/race/${slug}/${year}/startlist/startlist`
+  ];
+
+  for (const url of startlistUrls) {
+    try {
+      const html = await fetchPcsHtml(url);
+      if (!html || html.length < 100) {
+        continue;
+      }
+
+      const $ = cheerio.load(html);
+      const riders = [];
+
+      // PCS startlist structure:
+      // .page-content > ul > li (each = one team)
+      //   .ridersCont > a.team (team name)
+      //   ul > li (each = one rider)
+      //     span.bib (bib number)
+      //     a[href^="rider/"] (rider name + relative URL)
+      $('.page-content ul li').each((_, teamLi) => {
+        const $teamLi = $(teamLi);
+        // Only process team-level LIs (those containing a .ridersCont div)
+        const $ridersCont = $teamLi.children('.ridersCont');
+        if ($ridersCont.length === 0) return;
+
+        const teamName = $ridersCont.find('a.team').first().text().trim();
+
+        $ridersCont.find('ul li').each((_, riderLi) => {
+          const $riderLi = $(riderLi);
+          const riderLink = $riderLi.find('a[href^="rider/"], a[href*="/rider/"]').first();
+          if (!riderLink.length) return;
+
+          const name = riderLink.text().trim();
+          const riderUrl = riderLink.attr('href');
+          if (!name || name.length < 2 || name.length > 100) return;
+
+          // Check for DNF/DNS status in row text
+          const rowText = $riderLi.text();
+          let status = null;
+          if (/\bDNF\b/.test(rowText)) status = 'DNF';
+          else if (/\bDNS\b/.test(rowText)) status = 'DNS';
+
+          riders.push({
+            name,
+            team: teamName,
+            status,
+            rider_url: riderUrl || null
+          });
+        });
+      });
+
+      if (riders.length > 0) {
+        console.log(`  ✅ Found ${riders.length} riders from PCS`);
+        if (riders.length > 0) {
+          const statusStr = riders[0].status ? ` [${riders[0].status}]` : '';
+          console.log(`    Sample: ${riders[0].name} - Team: ${riders[0].team || '(no team)'}${statusStr}`);
+        }
+        return riders;
+      }
+    } catch (err) {
+      // Try next URL
+    }
+  }
+
+  return [];
+};
+
 const scrapeFirstCyclingStartlist = async (race) => {
   const startlistUrls = [];
   
@@ -1327,6 +1402,18 @@ const scrapeFirstCyclingStartlist = async (race) => {
     } catch (err) {
       console.log(`    Error fetching ${url}: ${err.message.split('\n')[0]}`);
     }
+  }
+
+  // Fallback to PCS if FirstCycling didn't yield riders
+  try {
+    console.log('  ℹ️  FirstCycling startlist unavailable, trying PCS...');
+    const pcsRiders = await scrapePcsStartlist(race);
+    if (pcsRiders && pcsRiders.length > 0) {
+      console.log(`  ✅ Scraped ${pcsRiders.length} riders from PCS startlist`);
+      return pcsRiders;
+    }
+  } catch (err) {
+    // PCS fallback also failed
   }
 
   console.log('  ⚠️  No riders found for startlist');
@@ -1787,8 +1874,8 @@ async function main() {
   const races = await fetchFirstCyclingWorldTourRaces(2026, DEFAULT_WORLDTOUR_URL);
   
   if (races.length === 0) {
-    console.log('❌ No UWT races found. Check FIRSTCYCLING_COOKIE or calendar URL.');
-    process.exit(1);
+    console.log('⚠️  No UWT races found from calendar — skipping race insertion. Subsequent scripts will still run.');
+    return;
   }
   
   console.log(`✅ Found ${races.length} UWT races for 2026\n`);
@@ -1862,6 +1949,7 @@ module.exports = {
   insertRaceData,
   fetchFirstCyclingWorldTourRaces,
   scrapeFirstCyclingStartlist,
+  scrapePcsStartlist,
   scrapeFirstCyclingRiderStatus,
   scrapePcsRiderStatusWithStage,
   resolvePcsRaceSlug,
