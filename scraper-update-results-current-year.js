@@ -435,20 +435,48 @@ function extractRankedPcsTablesWithMeta(html) {
 
   for (const [index, table] of $('table').toArray().entries()) {
     const $table = $(table);
-    const headers = $table.find('th').map((_, th) => normalizeName($(th).text()).toLowerCase()).get();
+    const headerCells = $table.find('th').map((_, th) => normalizeName($(th).text()).toLowerCase()).get();
     const rows = $table.find('tbody tr').length ? $table.find('tbody tr') : $table.find('tr');
-    const riders = [];
+
+    // Detect if there's a "GC" column (second <td> on PCS stage-result-with-GC pages).
+    // When present the table is sorted by stage rank, not GC position — we must
+    // sort by the GC column value to find the true GC leader and lanterne rouge.
+    const gcColIndex = headerCells.indexOf('gc');
+    const hasGcCol = gcColIndex !== -1;
+
+    const riderRows = []; // { rider, gcPos }
 
     for (const row of rows.toArray()) {
       const $row = $(row);
       if (!isRankedResultRow($row)) continue;
       const rider = extractRiderNameFromPcsRow($row);
-      if (rider) riders.push(rider);
+      if (!rider) continue;
+
+      let gcPos = null;
+      if (hasGcCol) {
+        const cellText = normalizeName($row.find('td').eq(gcColIndex).text()).replace(/\.$/, '');
+        const parsed = parseInt(cellText, 10);
+        if (!isNaN(parsed)) gcPos = parsed;
+      }
+
+      riderRows.push({ rider, gcPos });
     }
 
-    if (riders.length > 0) {
-      tables.push({ index, headers, riders });
+    if (riderRows.length === 0) continue;
+
+    // If we found a GC column with valid values, sort by GC position so that
+    // riders[0] = GC leader and riders[last] = GC lanterne rouge, regardless
+    // of how PCS ordered the rows (which is by stage time, not GC time).
+    if (hasGcCol && riderRows.some(r => r.gcPos !== null)) {
+      riderRows.sort((a, b) => {
+        if (a.gcPos === null && b.gcPos === null) return 0;
+        if (a.gcPos === null) return 1;
+        if (b.gcPos === null) return -1;
+        return a.gcPos - b.gcPos;
+      });
     }
+
+    tables.push({ index, headers: headerCells, riders: riderRows.map(r => r.rider) });
   }
 
   return tables;
@@ -613,9 +641,10 @@ async function scrapePcsRaceClassificationResults(race, isOneDayRace) {
 
       gcRiders = selectedTable.riders;
       results.GC_WINNER = selectedTable.riders[0] || null;
-      results.LOWEST_GC_FINISHER = selectedTable.riders[selectedTable.riders.length - 1] || null;
+      // Don't set LOWEST_GC_FINISHER here — it will be resolved from the
+      // dedicated /gc page below, which has the full finisher list and avoids
+      // picking the last rider of a smaller embedded stage-result table.
       results.sourceUrls.GC_WINNER = url;
-      results.sourceUrls.LOWEST_GC_FINISHER = url;
       break;
     } catch (err) {
       // Try next GC URL.
@@ -642,6 +671,8 @@ async function scrapePcsRaceClassificationResults(race, isOneDayRace) {
           return normalizeCompareName(first) === gcWinnerKey;
         });
 
+        // Always pick the largest matching table — the full results table
+        // has the most finishers; smaller tables are partial/podium only.
         const selectedTable = (matchingTables.length > 0 ? matchingTables : rankedTables)
           .slice()
           .sort((a, b) => b.length - a.length)[0];
@@ -657,28 +688,34 @@ async function scrapePcsRaceClassificationResults(race, isOneDayRace) {
     }
   }
 
-  // For stage races, use the full GC page to determine the true red-lantern.
+  // For stage races, use the dedicated /gc page to determine the true red-lantern.
+  // We always pick the LARGEST ranked table whose first rider matches the GC
+  // winner — this is the complete GC standings, not a partial podium or stage
+  // result table that may also appear on the page.
   if (!isOneDayRace && gcRiders.length > 0) {
     try {
       const fullGcHtml = await fetchPcsHtml(gcUrl);
-      const rankedTables = extractRankedPcsTablesWithMeta(fullGcHtml).map((table) => table.riders);
+      const allRankedTables = extractRankedPcsTablesWithMeta(fullGcHtml).map((t) => t.riders);
       const gcWinnerKey = normalizeCompareName(results.GC_WINNER);
 
-      const matchingTables = rankedTables.filter((riders) => {
+      const matchingTables = allRankedTables.filter((riders) => {
         const first = riders && riders.length > 0 ? riders[0] : null;
         return normalizeCompareName(first) === gcWinnerKey;
       });
 
-      const selectedTable = (matchingTables.length > 0 ? matchingTables : rankedTables)
+      // If no table starts with the GC winner, fall back to all tables —
+      // but always sort by size descending so we pick the full standings.
+      const candidateTables = (matchingTables.length > 0 ? matchingTables : allRankedTables)
         .slice()
-        .sort((a, b) => b.length - a.length)[0];
+        .sort((a, b) => b.length - a.length);
 
-      if (selectedTable && selectedTable.length > 0) {
-        results.LOWEST_GC_FINISHER = selectedTable[selectedTable.length - 1] || null;
+      const bestTable = candidateTables[0];
+      if (bestTable && bestTable.length > 0) {
+        results.LOWEST_GC_FINISHER = bestTable[bestTable.length - 1] || null;
         results.sourceUrls.LOWEST_GC_FINISHER = gcUrl;
       }
     } catch (err) {
-      // Keep fallback LOWEST_GC_FINISHER from results/gc table.
+      // LOWEST_GC_FINISHER remains null if the GC page is unavailable.
     }
   }
 
@@ -798,6 +835,96 @@ async function scrapePcsStageWinner(race, stageNumber) {
   }
 
   return { winner: null, sourceUrl: primaryUrl };
+}
+
+async function scrapePcsStageClassifications(race, stageNumber) {
+  if (!race || !race.id || !Number.isFinite(Number(stageNumber))) {
+    return {
+      gc_leader: null,
+      points_leader: null,
+      youth_leader: null,
+      kom_leader: null,
+      lanterne_rouge: null,
+    };
+  }
+
+  const slug = await resolvePcsRaceSlug(race);
+  const year = Number(race.year || TARGET_YEAR);
+  const stage = Number(stageNumber);
+  if (!slug || !Number.isFinite(year)) {
+    return {
+      gc_leader: null,
+      points_leader: null,
+      youth_leader: null,
+      kom_leader: null,
+      lanterne_rouge: null,
+    };
+  }
+
+  const baseUrl = `https://www.procyclingstats.com/race/${slug}/${year}`;
+  const gcUrl = `${baseUrl}/stage-${stage}/gc`;
+  const pointsUrl = `${baseUrl}/stage-${stage}/points`;
+  const youthUrl = `${baseUrl}/stage-${stage}/youth`;
+  const komUrl = `${baseUrl}/stage-${stage}/kom`;
+
+  const results = {
+    gc_leader: null,
+    points_leader: null,
+    youth_leader: null,
+    kom_leader: null,
+    lanterne_rouge: null,
+  };
+
+  // Fetch GC
+  try {
+    const gcHtml = await axios.get(gcUrl, { headers, timeout: 15000 });
+    const tables = extractRankedPcsTablesWithMeta(gcHtml.data);
+    const gcTable = selectPcsClassificationTable(tables, 'GC_WINNER');
+    if (gcTable && gcTable.riders.length > 0) {
+      results.gc_leader = gcTable.riders[0];
+      results.lanterne_rouge = gcTable.riders[gcTable.riders.length - 1];
+    }
+  } catch (err) {
+    // Ignore errors
+  }
+
+  // Fetch points
+  try {
+    const pointsHtml = await axios.get(pointsUrl, { headers, timeout: 15000 });
+    const tables = extractRankedPcsTablesWithMeta(pointsHtml.data);
+    const pointsTable = selectPcsClassificationTable(tables, 'POINTS_WINNER');
+    if (pointsTable && pointsTable.riders.length > 0) {
+      results.points_leader = pointsTable.riders[0];
+    }
+  } catch (err) {
+    // Ignore errors
+  }
+
+  // Fetch youth
+  try {
+    const youthHtml = await axios.get(youthUrl, { headers, timeout: 15000 });
+    const tables = extractRankedPcsTablesWithMeta(youthHtml.data);
+    const youthTable = selectPcsClassificationTable(tables, 'YOUTH_WINNER');
+    if (youthTable && youthTable.riders.length > 0) {
+      results.youth_leader = youthTable.riders[0];
+    }
+  } catch (err) {
+    // Ignore errors
+  }
+
+  // Fetch KOM
+  try {
+    const komHtml = await axios.get(komUrl, { headers, timeout: 15000 });
+    const tables = extractRankedPcsTablesWithMeta(komHtml.data);
+    const komTable = selectPcsClassificationTable(tables, 'MOUNTAIN_WINNER');
+    if (komTable && komTable.riders.length > 0) {
+      results.kom_leader = komTable.riders[0];
+    }
+  } catch (err) {
+    // Ignore errors
+  }
+
+  return results;
 }
 
 async function scrapePcsOneDayRaceWinner(race) {
@@ -1043,11 +1170,16 @@ async function loadRacesAndStages() {
   };
 }
 
-async function updateStageWinner(stageId, winnerName) {
+async function updateStageResults(stageId, winnerName, classifications) {
   if (DRY_RUN) return;
 
   const payload = {
     winner: winnerName || null,
+    gc_leader: classifications.gc_leader || null,
+    points_leader: classifications.points_leader || null,
+    youth_leader: classifications.youth_leader || null,
+    kom_leader: classifications.kom_leader || null,
+    lanterne_rouge: classifications.lanterne_rouge || null,
     results_year: TARGET_YEAR,
     results_scraped_at: new Date().toISOString(),
   };
@@ -1150,6 +1282,7 @@ async function main() {
     for (const stage of startedStages) {
       const scrapedStageNumber = Math.max(0, Number(stage.stage_number) + stageNumberOffset);
       const { winner, sourceUrl } = await scrapeStageWinner(stage, scrapedStageNumber, race);
+      const classifications = await scrapePcsStageClassifications(race, scrapedStageNumber);
       const existingWinner = normalizeCompareName(stage.winner);
       const scrapedWinner = normalizeCompareName(winner);
       const resolvedWinner = winner || stage.winner || null;
@@ -1158,8 +1291,8 @@ async function main() {
         resolvedStageWinners.set(String(stage.id), resolvedWinner);
       }
 
-      if (winner && existingWinner !== scrapedWinner) {
-        await updateStageWinner(stage.id, winner);
+      if (winner && existingWinner !== scrapedWinner || classifications.gc_leader) {
+        await updateStageResults(stage.id, winner, classifications);
         updatedStages += 1;
       }
 
@@ -1171,6 +1304,7 @@ async function main() {
         ? ` [from s=${scrapedStageNumber}]`
         : '';
       console.log(`  Stage ${stage.stage_number}${mappingLabel}: ${winner || 'not found'}${sourceUrl ? ` (${sourceUrl})` : ''}`);
+      console.log(`    GC: ${classifications.gc_leader || 'N/A'}, Points: ${classifications.points_leader || 'N/A'}, Youth: ${classifications.youth_leader || 'N/A'}, KOM: ${classifications.kom_leader || 'N/A'}, Lanterne: ${classifications.lanterne_rouge || 'N/A'}`);
       await sleep(250);
     }
 
@@ -1192,7 +1326,7 @@ async function main() {
         const nextStageWinner = normalizeCompareName(raceWinner);
         resolvedStageWinners.set(String(oneDayStage.id), raceWinner);
         if (existingStageWinner !== nextStageWinner) {
-          await updateStageWinner(oneDayStage.id, raceWinner);
+          await updateStageResults(oneDayStage.id, raceWinner, {});
           updatedStages += 1;
         }
       }
