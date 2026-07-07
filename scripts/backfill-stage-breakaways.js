@@ -823,6 +823,29 @@ function buildPcsTimeSplitsUrl(resultUrl) {
   return `${base}/live/time-splits`;
 }
 
+function extractPcsTeamNameFromRow($, row) {
+  const teamLink = row.find('a[href*="/team/"], a[href*="team/"], a[href*="team.php"]').first();
+  if (teamLink.length) {
+    return normalizeWhitespace(teamLink.text());
+  }
+
+  const cells = row.find('td').toArray().map((td) => normalizeWhitespace($(td).text()));
+  return cells.find((cell) => cell && !/^\d+$/.test(cell) && cell.length >= 3) || '';
+}
+
+function findPcsT1CellIndex($, row) {
+  const cells = row.find('td').toArray();
+  const teamCellIndex = cells.findIndex((td) => $(td).find('a[href*="/team/"], a[href*="team/"], a[href*="team.php"]').length);
+  const startIndex = teamCellIndex >= 0 ? teamCellIndex + 1 : 0;
+
+  for (let index = startIndex; index < cells.length; index += 1) {
+    const text = normalizeWhitespace($(cells[index]).text());
+    if (parseTimeToken(text)) return index;
+  }
+
+  return -1;
+}
+
 function parseRankToken(value) {
   const text = normalizeWhitespace(value);
   if (!text) return null;
@@ -835,7 +858,47 @@ function parseRankToken(value) {
 function parseTimeToken(value) {
   const text = normalizeWhitespace(value);
   if (!text || text === '-') return false;
-  return /^\d{1,2}[\.,:]\d{1,2}(?:[\.,:]\d+)?$/.test(text);
+  return /^\d{1,3}(?:[.,:]\d{1,3}){1,3}$/.test(text);
+}
+
+function parsePcsTimeToSeconds(value) {
+  const text = normalizeWhitespace(value).replace(/\s+/g, '');
+  if (!text || text === '-') return null;
+
+  if (text.includes(':')) {
+    const parts = text.split(':').map((part) => part.replace(/,/g, '.'));
+    let total = 0;
+    for (const part of parts) {
+      const numericPart = Number(part);
+      if (!Number.isFinite(numericPart)) return null;
+      total = total * 60 + numericPart;
+    }
+    return total;
+  }
+
+  const groups = text.match(/\d+/g) || [];
+  if (!groups.length) return null;
+
+  const lastGroup = groups[groups.length - 1];
+  if (groups.length === 1) {
+    return Number(groups[0]);
+  }
+
+  if (groups.length === 2 && lastGroup.length > 2) {
+    return Number(`${groups[0]}.${groups[1]}`);
+  }
+
+  if (groups.length === 2) {
+    return Number(groups[0]) * 60 + Number(groups[1]);
+  }
+
+  const [minutes, seconds, fractional] = groups.map((group) => Number(group));
+  if (groups.length >= 3) {
+    const fractionalSeconds = Number.isFinite(fractional) ? fractional / Math.pow(10, String(fractional).length) : 0;
+    return minutes * 60 + seconds + fractionalSeconds;
+  }
+
+  return null;
 }
 
 function normalizePcsDisplayName(value) {
@@ -851,12 +914,6 @@ function normalizePcsDisplayName(value) {
     .join(' ');
 }
 
-function buildPcsSortedT1Url(raceId) {
-  const id = String(raceId || '').trim();
-  if (!/^\d+$/.test(id)) return '';
-  return `https://www.procyclingstats.com/race.php?id=${id}&p=live&s=time-splits&t1c=1&t9c=1&timesc=1&rnksc=1&avgsc=1&sortby=t1time&filter2=Apply+filter`;
-}
-
 async function scrapePcsFastestT1Rider(resultUrl) {
   const resultHtml = await getHtml(resultUrl);
   const $result = cheerio.load(resultHtml);
@@ -864,26 +921,38 @@ async function scrapePcsFastestT1Rider(resultUrl) {
 
   // Limit this path to TT stages to avoid accidental use on non-TT stages.
   const resultTitle = normalizeWhitespace($result('title').text() || '');
-  const ttSignal = /time\s*trial|\(itt\)|\(ttt\)|\bitt\b|\bttt\b/i.test(`${resultTitle} ${resultText}`);
+  const ttSignal = /time\s*trial|\(itt\)|\(ttt\)|\bteam\s*time\b|\bitt\b|\bttt\b/i.test(`${resultTitle} ${resultText}`);
   if (!ttSignal) return { rider: '', rank: null, isTimeTrial: false };
 
-  const raceId = normalizeWhitespace($result('input[name="race_id"]').first().attr('value') || '');
-  const sortedUrl = buildPcsSortedT1Url(raceId);
-  if (!sortedUrl) return { rider: '', rank: null, isTimeTrial: true };
+  const timeSplitsUrl = buildPcsTimeSplitsUrl(resultUrl);
+  if (!timeSplitsUrl) return { rider: '', rank: null, isTimeTrial: true };
 
-  const sortedHtml = await getHtml(sortedUrl);
-  const $ = cheerio.load(sortedHtml);
+  const timeSplitsHtml = await getHtml(timeSplitsUrl);
+  const $ = cheerio.load(timeSplitsHtml);
 
-  let topRider = '';
+  let bestTeam = '';
+  let bestSeconds = null;
+  let bestTimeText = '';
+
   $('tr').each((_, tr) => {
-    if (topRider) return;
-    const riderLink = $(tr).find('a[href*="rider/"]').first();
-    const riderName = normalizePcsDisplayName(riderLink.text());
-    if (riderName) topRider = riderName;
+    const row = $(tr);
+    const teamName = extractPcsTeamNameFromRow($, row);
+    const t1CellIndex = findPcsT1CellIndex($, row);
+    if (!teamName || t1CellIndex < 0) return;
+
+    const t1Text = normalizeWhitespace($(row.find('td').eq(t1CellIndex)).text());
+    const t1Seconds = parsePcsTimeToSeconds(t1Text);
+    if (t1Seconds === null) return;
+
+    if (!bestTeam || t1Seconds < bestSeconds) {
+      bestTeam = teamName;
+      bestSeconds = t1Seconds;
+      bestTimeText = t1Text;
+    }
   });
 
-  if (!topRider) return { rider: '', rank: null, isTimeTrial: true, url: sortedUrl };
-  return { rider: topRider, rank: 1, isTimeTrial: true, url: sortedUrl };
+  if (!bestTeam) return { rider: '', rank: null, isTimeTrial: true, url: timeSplitsUrl };
+  return { rider: bestTeam, team: bestTeam, rank: 1, isTimeTrial: true, url: timeSplitsUrl, t1Time: bestTimeText };
 }
 
 async function scrapePcsShieldRiders(url) {
@@ -1339,16 +1408,12 @@ async function run() {
       }
 
       if (ttT1 && ttT1.rider) {
-        const translatedT1Rider = await translatePcsRiderNameToDbName(ttT1.rider, stage.race_id);
-        if (normalizeWhitespace(translatedT1Rider) !== normalizeWhitespace(ttT1.rider)) {
-          console.log(`  Name translated: ${ttT1.rider} -> ${translatedT1Rider}`);
-        }
-
+        const t1Name = normalizeWhitespace(ttT1.team || ttT1.rider || '');
         const sentence = `T1_TIME_SPLIT rank=${ttT1.rank || 1}`;
-        const wrote = await saveBreakaways(stage.id, ttT1.url, sentence, [translatedT1Rider], 'high', { rewriteExisting: true });
+        const wrote = await saveBreakaways(stage.id, ttT1.url, sentence, [t1Name], 'high', { rewriteExisting: true });
         withHits += 1;
         insertedRows += wrote;
-        console.log(`  TT T1 saved ${wrote} rider(s) from ${ttT1.url}`);
+        console.log(`  TT T1 saved ${wrote} team/value from ${ttT1.url}`);
         continue;
       }
 
