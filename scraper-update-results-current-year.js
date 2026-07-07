@@ -560,8 +560,27 @@ function isTeamTimeTrialStagePage(html) {
   const $ = cheerio.load(String(html || ''));
   const titleText = normalizeName($('title').first().text()).toLowerCase();
   const headingText = normalizeName($('h1, h2').first().text()).toLowerCase();
-  const text = `${titleText} ${headingText}`;
-  return /\(ttt\)|\bttt\b|\bteam\s*time\s*trial\b/.test(text);
+  const bodyText = normalizeName($('body').text()).toLowerCase();
+  const text = `${titleText} ${headingText} ${bodyText}`;
+
+  if (/\(ttt\)|\bttt\b|\bteam\s*time\s*trial\b|\bteam\s*time\b|\btime\s*trial\b/.test(text)) {
+    return true;
+  }
+
+  const hasRankedTeamRows = $('table').toArray().some((table) => {
+    const $table = $(table);
+    const rows = $table.find('tbody tr').length ? $table.find('tbody tr') : $table.find('tr');
+    return rows.toArray().some((row) => {
+      const $row = $(row);
+      const firstCellText = normalizeName($row.find('td').first().text()).replace(/\.$/, '');
+      const hasRank = /^\d{1,3}$/.test(firstCellText);
+      const hasTeamLink = Boolean($row.find('a[href*="/team/"], a[href*="team/"], a[href*="team.php"]').length);
+      const hasRiderLink = Boolean($row.find('a[href*="/rider/"], a[href*="rider/"], a[href*="rider.php"]').length);
+      return hasRank && hasTeamLink && hasRiderLink;
+    });
+  });
+
+  return Boolean(hasRankedTeamRows) && /team/.test(text) && /time/.test(text);
 }
 
 function extractRankedRidersFromPcsTable(html) {
@@ -812,9 +831,9 @@ async function scrapePcsStageWinner(race, stageNumber) {
       // PCS sometimes exposes team-only winner rows for TTT stages.
       const isTtt = isTeamTimeTrialStagePage(html);
       if (isTtt) {
-        const teamWinner = extractFirstTeamFromTeamOnlyRankedTable(html)
-          || extractFirstTeamFromRankedTable(html)
-          || extractFirstTeamFromTable(html);
+        const teamWinner = extractFirstTeamFromRankedTable(html)
+          || extractFirstTeamFromTable(html)
+          || extractFirstTeamFromTeamOnlyRankedTable(html);
         if (teamWinner) {
           return { winner: teamWinner, sourceUrl: url };
         }
