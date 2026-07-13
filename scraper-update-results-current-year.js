@@ -541,6 +541,21 @@ async function fetchPcsHtml(url) {
     });
     return response.data;
   } catch (err) {
+    const status = Number(err?.response?.status);
+    if (status === 429) {
+      // Rate limited - wait and retry once
+      console.log(`    ⏱️  Rate limited (429), waiting before retry...`);
+      await sleep(5000);
+      try {
+        const retryResponse = await axios.get(url, {
+          headers: pcsHeaders,
+          timeout: 15000,
+        });
+        return retryResponse.data;
+      } catch (retryErr) {
+        throw retryErr;
+      }
+    }
     throw err;
   }
 }
@@ -1305,7 +1320,7 @@ async function main() {
         : '';
       console.log(`  Stage ${stage.stage_number}${mappingLabel}: ${winner || 'not found'}${sourceUrl ? ` (${sourceUrl})` : ''}`);
       console.log(`    GC: ${classifications.gc_leader || 'N/A'}, Points: ${classifications.points_leader || 'N/A'}, Youth: ${classifications.youth_leader || 'N/A'}, KOM: ${classifications.kom_leader || 'N/A'}, Lanterne: ${classifications.lanterne_rouge || 'N/A'}`);
-      await sleep(250);
+      await sleep(1500);
     }
 
     let allStageWinnersKnown = nonRestStages.length > 0
@@ -1370,7 +1385,7 @@ async function main() {
       console.log('  Race classifications: already present, skipped');
     }
 
-    await sleep(400);
+    await sleep(1500);
   }
 
   console.log('\n✅ Daily current-year results scraping finished.');
