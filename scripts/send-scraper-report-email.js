@@ -15,9 +15,9 @@ const PLAYER_DISPLAY_NAMES = {
   [PLAYER_IDS.B]: 'Koen'
 };
 const POINTS = {
-  oneDay: { head: 10, t1: 6, grill: 40, rode_lantaarn: 20 },
-  monumentOneDay: { head: 20, t1: 12, grill: 80, rode_lantaarn: 40 },
-  stage: { head: 5, t1: 3, grill: 20 },
+  oneDay: { head: 10, t1: 6, t1_winner: 8, grill: 40, rode_lantaarn: 20 },
+  monumentOneDay: { head: 20, t1: 12, t1_winner: 16, grill: 80, rode_lantaarn: 40 },
+  stage: { head: 5, t1: 3, t1_winner: 4, grill: 20 },
   race: { GC: 10, Sprint: 10, KOM: 20, 'Pogi Trui': 10, 'Rode Lantaarn': 20 }
 };
 const RACE_CATEGORY_LABELS = {
@@ -911,7 +911,13 @@ function computeCompletedPredictionSetsForPlayerRows(playerRows, stageById, race
     const stage = stageById.get(String(stageId));
     if (!stage) return;
     const requiredStageKeys = getRequiredStageCategoryKeysForRaceId(stage.race_id, raceIsOneDayById);
-    const hasAllRequired = requiredStageKeys.every((key) => categories.has(key));
+    // Check if all required keys are present, treating 't1' and 't1_winner' as alternatives
+    const hasAllRequired = requiredStageKeys.every((key) => {
+      if (key === 't1') {
+        return categories.has('t1') || categories.has('t1_winner');
+      }
+      return categories.has(key);
+    });
     if (hasAllRequired) completedStages.add(String(stageId));
   });
 
@@ -1791,9 +1797,17 @@ async function buildReportText() {
     if (!stage) return false;
 
     const category = String(prediction && prediction.category || '').toLowerCase();
+    const normalizedStageWinner = normalizeRiderName(getStageWinnerName(stage));
+    
+    // t1_winner: rider must be stage winner
+    if (category === 't1_winner') {
+      if (!normalizedStageWinner) return false;
+      return normalizeRiderName(prediction && prediction.rider_name) === normalizedStageWinner;
+    }
+    
+    // t1: rider must be in breakaway (or stage winner for TTT)
     if (category === 't1') {
       if (getTimeTrialStageLabel(stage) === 'TTT') {
-        const normalizedStageWinner = normalizeRiderName(getStageWinnerName(stage));
         if (!normalizedStageWinner) return false;
         return normalizeRiderName(prediction && prediction.rider_name) === normalizedStageWinner;
       }
@@ -1804,7 +1818,7 @@ async function buildReportText() {
       return breakawayRiders.some((name) => isRiderNameMatch(name, prediction && prediction.rider_name));
     }
 
-    const normalizedStageWinner = normalizeRiderName(getStageWinnerName(stage));
+    // head/grill/rode_lantaarn: rider must be stage winner
     if (!normalizedStageWinner) return false;
     return normalizeRiderName(prediction && prediction.rider_name) === normalizedStageWinner;
   }
@@ -1819,7 +1833,7 @@ async function buildReportText() {
     const stage = stageById.get(String(prediction && prediction.stage_id || ''));
     if (!stage) return null;
     const category = String(prediction && prediction.category || '').toLowerCase();
-    if (category === 't1' && getTimeTrialStageLabel(stage) !== 'TTT') {
+    if ((category === 't1' || category === 't1_winner') && getTimeTrialStageLabel(stage) !== 'TTT') {
       return breakawayUpdatedTsByStageId.get(String(stage.id)) || null;
     }
     return parseTimestamp(stage.updated_at);
@@ -1829,10 +1843,10 @@ async function buildReportText() {
     [PLAYER_IDS.A]: 0,
     [PLAYER_IDS.B]: 0
   };
-  const STAGE_POINT_CATS = ['head', 't1', 'grill'];
-  const STAGE_POINT_CAT_LABELS = { head: 'Head', t1: 'T1', grill: 'Grill' };
+  const STAGE_POINT_CATS = ['head', 't1', 't1_winner', 'grill'];
+  const STAGE_POINT_CAT_LABELS = { head: 'Head', t1: 'T1', t1_winner: 'T1+W', grill: 'Grill' };
   function makeEmptyStageCatMap() {
-    return { head: 0, t1: 0, grill: 0 };
+    return { head: 0, t1: 0, t1_winner: 0, grill: 0 };
   }
 
   const stagePointsByStageId = new Map();
