@@ -123,15 +123,51 @@ function isRankedResultRow($row) {
 function extractFirstRiderFromTable(html) {
   const $ = cheerio.load(html);
 
+  // Find the table with the most ranked rows (stage results) instead of
+  // classification tables which are smaller. Stage results have 100+ riders.
+  let bestTable = null;
+  let maxRankedRows = 0;
+
   for (const table of $('table').toArray()) {
     const $table = $(table);
     const rows = $table.find('tbody tr').length ? $table.find('tbody tr') : $table.find('tr');
+    let rankedRowCount = 0;
 
     for (const row of rows.toArray()) {
-      const rider = extractRiderNameFromRow($(row));
-      if (rider) {
-        return rider;
+      const $row = $(row);
+      if (isRankedResultRow($row)) {
+        rankedRowCount++;
       }
+    }
+
+    // Prefer tables with many ranked rows (stage results), skip small classification tables
+    if (rankedRowCount > maxRankedRows && rankedRowCount >= 50) {
+      maxRankedRows = rankedRowCount;
+      bestTable = $table;
+    }
+  }
+
+  // If no large table found, fall back to first table
+  if (!bestTable) {
+    for (const table of $('table').toArray()) {
+      const $table = $(table);
+      const rows = $table.find('tbody tr').length ? $table.find('tbody tr') : $table.find('tr');
+      for (const row of rows.toArray()) {
+        const rider = extractRiderNameFromRow($(row));
+        if (rider) {
+          return rider;
+        }
+      }
+    }
+    return null;
+  }
+
+  // Extract from the best table
+  const rows = bestTable.find('tbody tr').length ? bestTable.find('tbody tr') : bestTable.find('tr');
+  for (const row of rows.toArray()) {
+    const rider = extractRiderNameFromRow($(row));
+    if (rider) {
+      return rider;
     }
   }
 
@@ -141,18 +177,57 @@ function extractFirstRiderFromTable(html) {
 function extractFirstTeamFromTable(html) {
   const $ = cheerio.load(html);
 
+  // Find the table with the most ranked rows (stage results) instead of
+  // classification tables. Stage results have 100+ riders.
+  let bestTable = null;
+  let maxRankedRows = 0;
+
   for (const table of $('table').toArray()) {
     const $table = $(table);
     const rows = $table.find('tbody tr').length ? $table.find('tbody tr') : $table.find('tr');
+    let rankedRowCount = 0;
 
     for (const row of rows.toArray()) {
       const $row = $(row);
-      if (!isRankedResultRow($row)) continue;
-
-      const team = extractTeamNameFromRow($row);
-      if (team) {
-        return team;
+      if (isRankedResultRow($row)) {
+        rankedRowCount++;
       }
+    }
+
+    if (rankedRowCount > maxRankedRows && rankedRowCount >= 50) {
+      maxRankedRows = rankedRowCount;
+      bestTable = $table;
+    }
+  }
+
+  // If no large table found, fall back to first table
+  if (!bestTable) {
+    for (const table of $('table').toArray()) {
+      const $table = $(table);
+      const rows = $table.find('tbody tr').length ? $table.find('tbody tr') : $table.find('tr');
+
+      for (const row of rows.toArray()) {
+        const $row = $(row);
+        if (!isRankedResultRow($row)) continue;
+
+        const team = extractTeamNameFromRow($row);
+        if (team) {
+          return team;
+        }
+      }
+    }
+    return null;
+  }
+
+  // Extract from the best table
+  const rows = bestTable.find('tbody tr').length ? bestTable.find('tbody tr') : bestTable.find('tr');
+  for (const row of rows.toArray()) {
+    const $row = $(row);
+    if (!isRankedResultRow($row)) continue;
+
+    const team = extractTeamNameFromRow($row);
+    if (team) {
+      return team;
     }
   }
 
@@ -162,27 +237,166 @@ function extractFirstTeamFromTable(html) {
 function extractFirstTeamFromRankedTable(html) {
   const $ = cheerio.load(html);
 
+  // Find the table with the most ranked rows (stage results) instead of
+  // classification tables. Stage results have 100+ riders.
+  let bestTable = null;
+  let maxRankedRows = 0;
+
   for (const table of $('table').toArray()) {
     const $table = $(table);
     const rows = $table.find('tbody tr').length ? $table.find('tbody tr') : $table.find('tr');
+    let rankedRowCount = 0;
 
     for (const row of rows.toArray()) {
       const $row = $(row);
-      if (!isRankedResultRow($row)) continue;
-
-      const team = extractTeamNameFromRow($row);
-      if (team) {
-        return team;
+      if (isRankedResultRow($row)) {
+        rankedRowCount++;
       }
+    }
+
+    if (rankedRowCount > maxRankedRows && rankedRowCount >= 50) {
+      maxRankedRows = rankedRowCount;
+      bestTable = $table;
+    }
+  }
+
+  // If no large table found, fall back to first table
+  if (!bestTable) {
+    for (const table of $('table').toArray()) {
+      const $table = $(table);
+      const rows = $table.find('tbody tr').length ? $table.find('tbody tr') : $table.find('tr');
+
+      for (const row of rows.toArray()) {
+        const $row = $(row);
+        if (!isRankedResultRow($row)) continue;
+
+        const team = extractTeamNameFromRow($row);
+        if (team) {
+          return team;
+        }
+      }
+    }
+    return null;
+  }
+
+  // Extract from the best table
+  const rows = bestTable.find('tbody tr').length ? bestTable.find('tbody tr') : bestTable.find('tr');
+  for (const row of rows.toArray()) {
+    const $row = $(row);
+    if (!isRankedResultRow($row)) continue;
+
+    const team = extractTeamNameFromRow($row);
+    if (team) {
+      return team;
     }
   }
 
   return null;
 }
 
+function extractTeamFromTTTDisplaySection(html) {
+  // For TTT stages, PCS displays results in sections with class "timeSpeed"
+  // Each section shows: [ranking] [team name] [timeSpeed div with results]
+  // The first timeSpeed section contains the winner's team
+  const $ = cheerio.load(html);
+  
+  const timeSpeeds = $('.timeSpeed');
+  if (timeSpeeds.length === 0) {
+    return null;
+  }
+  
+  // Get the first timeSpeed section (winner)
+  const firstTimeSpeed = timeSpeeds.first();
+  
+  // Find the team link in the parent container
+  // The parent <li> contains both the team info section and the timeSpeed section
+  const commonParent = firstTimeSpeed.parent();
+  
+  // Try to find team link using filter (selector matching is unreliable here)
+  let teamLink = commonParent.find('a').filter((i, el) => {
+    const href = $(el).attr('href');
+    return href && href.includes('team/');
+  }).first();
+  
+  // If not found, try the first link
+  if (!teamLink.length) {
+    teamLink = commonParent.find('a').first();
+    const href = teamLink.attr('href');
+    if (!href || !href.includes('team/')) {
+      return null;
+    }
+  }
+  
+  const teamName = teamLink.text().trim();
+  return teamName || null;
+}
+
 function extractFirstTeamFromTeamOnlyRankedTable(html) {
   const $ = cheerio.load(html);
 
+  // First, try extracting from TTT display sections (timeSpeed)
+  // This is the primary format for TTT results on PCS
+  const teamFromDisplay = extractTeamFromTTTDisplaySection(html);
+  if (teamFromDisplay) {
+    return teamFromDisplay;
+  }
+
+  // Fallback: For TTT results, find tables with:
+  // 1. Team-only rows (no rider names)
+  // 2. Ranked positions (1, 2, 3, etc.)
+  // 3. Return the team from rank 1 (the winner)
+  
+  let bestTable = null;
+  let maxTeamOnlyRows = 0;
+
+  for (const table of $('table').toArray()) {
+    const $table = $(table);
+    const rows = $table.find('tbody tr').length ? $table.find('tbody tr') : $table.find('tr');
+    let teamOnlyRowCount = 0;
+    let firstTeamOnlyTeam = null;
+
+    for (const row of rows.toArray()) {
+      const $row = $(row);
+      if (!isRankedResultRow($row)) continue;
+
+      const rider = extractRiderNameFromRow($row);
+      const team = extractTeamNameFromRow($row);
+      
+      // Only count rows with team but no rider as TTT rows
+      if (!rider && team) {
+        teamOnlyRowCount++;
+        if (!firstTeamOnlyTeam) {
+          firstTeamOnlyTeam = team;
+        }
+      }
+    }
+
+    // Prefer tables with many team-only rows (TTT results)
+    // Return immediately when we find a good TTT table (15+ teams)
+    if (teamOnlyRowCount > maxTeamOnlyRows && teamOnlyRowCount >= 15) {
+      maxTeamOnlyRows = teamOnlyRowCount;
+      bestTable = $table;
+    }
+  }
+
+  // If we found a TTT table with enough rows, extract the winner (first ranked team)
+  if (bestTable && maxTeamOnlyRows >= 15) {
+    const rows = bestTable.find('tbody tr').length ? bestTable.find('tbody tr') : bestTable.find('tr');
+    for (const row of rows.toArray()) {
+      const $row = $(row);
+      if (!isRankedResultRow($row)) continue;
+
+      const rider = extractRiderNameFromRow($row);
+      const team = extractTeamNameFromRow($row);
+      
+      // Return the first team-only row (winner)
+      if (!rider && team) {
+        return team;
+      }
+    }
+  }
+
+  // Fallback: find first table with team-only rows
   for (const table of $('table').toArray()) {
     const $table = $(table);
     const rows = $table.find('tbody tr').length ? $table.find('tbody tr') : $table.find('tr');
