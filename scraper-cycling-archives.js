@@ -572,7 +572,77 @@ const getRaceNumberFromUrl = (url) => {
   return match ? match[1] : null;
 };
 
+const normalizePcsImageUrl = (src) => {
+  const value = String(src || '').trim();
+  if (!value) return null;
+  if (value.startsWith('http://') || value.startsWith('https://')) return value;
+  if (value.startsWith('//')) return `https:${value}`;
+  if (value.startsWith('/')) return `https://www.procyclingstats.com${value}`;
+  return `https://www.procyclingstats.com/${value.replace(/^\.?\/+/, '')}`;
+};
+
+const resolvePcsStageProfileImageUrls = async (race, stageNumber) => {
+  const year = Number(race && race.year || DEFAULT_WORLDTOUR_YEAR);
+  const normalizedStageNumber = Number(stageNumber);
+  if (!Number.isFinite(year) || !Number.isFinite(normalizedStageNumber)) {
+    return { jpgUrl: null, pngUrl: null, chosenUrl: null };
+  }
+
+  const slug = await resolvePcsRaceSlug(race);
+  if (!slug) {
+    return { jpgUrl: null, pngUrl: null, chosenUrl: null };
+  }
+
+  // Use individual stage profile page (same as clear-and-reload script)
+  const stageUrl = `https://www.procyclingstats.com/race/${slug}/${year}/stage-${normalizedStageNumber}/info/profiles`;
+
+  try {
+    const html = await fetchPcsHtml(stageUrl);
+    const $ = cheerio.load(html);
+    
+    let chosenUrl = null;
+    
+    // Get the first profile image on the page
+    $('img[src*="profile"]').each((_, el) => {
+      const src = String($(el).attr('src') || '').trim();
+      if (src && !chosenUrl) {
+        chosenUrl = normalizePcsImageUrl(src);
+        return false; // break
+      }
+    });
+    
+    // Fallback: check data-src attribute
+    if (!chosenUrl) {
+      $('img[data-src*="profile"]').each((_, el) => {
+        const src = String($(el).attr('data-src') || '').trim();
+        if (src && !chosenUrl) {
+          chosenUrl = normalizePcsImageUrl(src);
+          return false; // break
+        }
+      });
+    }
+
+    if (!chosenUrl) {
+      return { jpgUrl: null, pngUrl: null, chosenUrl: null };
+    }
+
+    const lower = chosenUrl.toLowerCase();
+    return {
+      jpgUrl: lower.endsWith('.jpg') || lower.endsWith('.jpeg') ? chosenUrl : null,
+      pngUrl: lower.endsWith('.png') ? chosenUrl : null,
+      chosenUrl,
+    };
+  } catch (err) {
+    return { jpgUrl: null, pngUrl: null, chosenUrl: null };
+  }
+};
+
 const resolveStageProfileImageUrls = async (race, stageNumber, totalStages = null) => {
+  const pcsResolved = await resolvePcsStageProfileImageUrls(race, stageNumber);
+  if (pcsResolved && pcsResolved.chosenUrl) {
+    return pcsResolved;
+  }
+
   const raceNumber = getRaceNumberFromUrl(race.url);
   if (!raceNumber) {
     return { jpgUrl: null, pngUrl: null, chosenUrl: null };
@@ -605,19 +675,21 @@ const resolveStageProfileImageUrls = async (race, stageNumber, totalStages = nul
     }
   }
 
-  const jpgUrl = candidates.find((url) => String(url).toLowerCase().endsWith('.jpg')) || null;
-  const pngUrl = candidates.find((url) => String(url).toLowerCase().endsWith('.png')) || null;
-
   for (const url of candidates) {
     try {
       await axios.head(url, buildRequestOptions(10000));
-      return { jpgUrl, pngUrl, chosenUrl: url };
+      const lower = String(url).toLowerCase();
+      return {
+        jpgUrl: lower.endsWith('.jpg') || lower.endsWith('.jpeg') ? url : null,
+        pngUrl: lower.endsWith('.png') ? url : null,
+        chosenUrl: url,
+      };
     } catch (err) {
       // try next extension
     }
   }
 
-  return { jpgUrl, pngUrl, chosenUrl: null };
+  return { jpgUrl: null, pngUrl: null, chosenUrl: null };
 };
 
 const buildAbsoluteUrl = (href) => {
@@ -646,12 +718,19 @@ const fetchWithRetry = async (fetchFn, url, maxRetries = 3) => {
       return await fetchFn();
     } catch (err) {
       const status = err.response?.status;
-      const isRetryable = !err.response || status >= 500; // Retry on network errors or 5xx
+      // Retry on: network errors, 5xx, or 429 (rate limit)
+      const isRetryable = !err.response || status >= 500 || status === 429;
       const isLastAttempt = attempt === maxRetries;
 
       if (isRetryable && !isLastAttempt) {
-        const delay = Math.pow(2, attempt - 1) * 1000; // Exponential backoff: 1s, 2s, 4s
-        console.log(`  ⚠️  Attempt ${attempt}/${maxRetries} failed (${status || 'network error'}), retrying in ${delay}ms...`);
+        // For 429, use longer backoff with jitter
+        let delay;
+        if (status === 429) {
+          delay = Math.pow(2, attempt) * 2000 + Math.random() * 1000; // 4s, 8s, 16s + jitter
+        } else {
+          delay = Math.pow(2, attempt - 1) * 1000; // Exponential backoff: 1s, 2s, 4s
+        }
+        console.log(`  ⚠️  Attempt ${attempt}/${maxRetries} failed (status ${status || 'network error'}), retrying in ${delay}ms...`);
         await sleep(delay);
         continue;
       }
@@ -1467,7 +1546,11 @@ const scrapePcsRiderStatusWithStage = async (race) => {
     return statusByNormalizedName;
   }
 
+  console.log(`    📋 Scraping PCS for ${race.name} (slug=${slug}, year=${year})`);
+
+  // For ongoing races, try GC (general classification/standings) first, then startlist
   const urls = [
+    `https://www.procyclingstats.com/race/${slug}/${year}/gc`,
     `https://www.procyclingstats.com/race/${slug}/${year}/startlist`,
     `https://www.procyclingstats.com/race/${slug}/${year}/startlist/startlist`
   ];
@@ -1483,33 +1566,37 @@ const scrapePcsRiderStatusWithStage = async (race) => {
 
       const $ = cheerio.load(html);
 
-      // Parse rider status in a DOM-scoped way so a DNF/DNS marker from one rider
-      // cannot bleed into another rider in nearby HTML.
-      $('li').each((idx, el) => {
-        const $container = $(el);
-        const containerText = $container.text();
-        const statusWithStageMatch = containerText.match(/\((DNF|DNS)\s*#\s*(\d+)\)/i);
-        const statusOnlyMatch = containerText.match(/\((DNF|DNS)\)/i);
+      // Parse rider status: look for .dropout elements which contain text like "(DNF #15)" or "(DNS #7)"
+      $('body').find('[class*="dropout"]').each((idx, el) => {
+        const $el = $(el);
+        const elementText = $el.text().trim();
+        
+        // The dropdown element should contain pattern like "(DNF #15)" or "(DNS #7)"
+        // But cheerio includes surrounding text, so extract just the status part
+        const statusMatch = elementText.match(/\((DNF|DNS)\s*#\s*(\d+)\)/i);
+        if (!statusMatch) return;
 
-        const detectedStatus = statusWithStageMatch
-          ? statusWithStageMatch[1].toUpperCase()
-          : (statusOnlyMatch ? statusOnlyMatch[1].toUpperCase() : null);
+        const detectedStatus = statusMatch[1].toUpperCase();
+        const detectedStageNumber = Number(statusMatch[2]);
 
-        const detectedYouthEligible = containerText.includes('*');
+        // Extract rider name directly from the element's own text
+        // Format is: "BIB_NUM(digits)LASTNAME Firstname* (DNF/DNS #X)"
+        // Extract name portion before the parenthesis
+        let riderName = null;
+        const elementNameMatch = elementText.match(/\d+([A-ZÆØÅ][A-ZÆØÅ\s]+)\s+([A-Za-zæøå]+)\s*\*?\s*\(/);
+        if (elementNameMatch) {
+          riderName = `${elementNameMatch[1]} ${elementNameMatch[2]}`.trim();
+        }
 
-        if (!detectedStatus && !detectedYouthEligible) return;
+        if (!riderName || riderName.length < 2) return;
 
-        const detectedStageNumber = statusWithStageMatch
-          ? Number(statusWithStageMatch[2])
-          : null;
-
-        const riderLinks = $container.find('a[href*="rider/"]');
-        if (riderLinks.length !== 1) return;
-
-        const $riderLink = riderLinks.first();
-        const riderName = $riderLink.text().trim();
         const key = normalizeRiderLookupName(riderName);
         if (!key) return;
+
+        // Debug logging for specific riders
+        if (riderName.includes('DEBRUYNE') || riderName.includes('BERCKMOES')) {
+          console.log(`    🔍 Found ${riderName}: status=${detectedStatus}, stageNum=${detectedStageNumber}`);
+        }
 
         const existing = statusByNormalizedName.get(key);
         if (!existing) {
@@ -1517,73 +1604,26 @@ const scrapePcsRiderStatusWithStage = async (race) => {
             name: riderName,
             status: detectedStatus,
             stage_number: Number.isFinite(detectedStageNumber) ? detectedStageNumber : null,
-            youth_eligible: detectedYouthEligible,
+            youth_eligible: false,
             source: 'pcs'
           });
-          return;
+        } else {
+          existing.status = detectedStatus;
+          if (Number.isFinite(detectedStageNumber)) {
+            existing.stage_number = detectedStageNumber;
+          }
+          statusByNormalizedName.set(key, existing);
         }
-
-        if (!Number.isFinite(existing.stage_number) && Number.isFinite(detectedStageNumber)) {
-          existing.stage_number = detectedStageNumber;
-        }
-        if (detectedYouthEligible) {
-          existing.youth_eligible = true;
-        }
-        statusByNormalizedName.set(key, existing);
-      });
-
-      $('a[href*="rider/"]').each((idx, link) => {
-        const $link = $(link);
-        const riderName = $link.text().trim();
-        if (!riderName || riderName.length < 3) return;
-
-        const contextText = [
-          $link.parent().text(),
-          $link.closest('tr').text(),
-          $link.closest('li').text()
-        ].join(' ');
-
-        const statusWithStageMatch = contextText.match(/\((DNF|DNS)\s*#\s*(\d+)\)/i);
-        const statusOnlyMatch = contextText.match(/\((DNF|DNS)\)/i);
-
-        const detectedStatus = statusWithStageMatch
-          ? statusWithStageMatch[1].toUpperCase()
-          : (statusOnlyMatch ? statusOnlyMatch[1].toUpperCase() : null);
-
-        const detectedYouthEligible = contextText.includes('*');
-
-        if (!detectedStatus && !detectedYouthEligible) return;
-
-        const detectedStageNumber = statusWithStageMatch
-          ? Number(statusWithStageMatch[2])
-          : null;
-
-        const key = normalizeRiderLookupName(riderName);
-        if (!key) return;
-
-        const existing = statusByNormalizedName.get(key);
-        if (!existing) {
-          statusByNormalizedName.set(key, {
-            name: riderName,
-            status: detectedStatus,
-            stage_number: Number.isFinite(detectedStageNumber) ? detectedStageNumber : null,
-            youth_eligible: detectedYouthEligible,
-            source: 'pcs'
-          });
-          return;
-        }
-
-        if (!Number.isFinite(existing.stage_number) && Number.isFinite(detectedStageNumber)) {
-          existing.stage_number = detectedStageNumber;
-        }
-        if (detectedYouthEligible) {
-          existing.youth_eligible = true;
-        }
-        statusByNormalizedName.set(key, existing);
       });
 
       if (statusByNormalizedName.size > 0) {
         console.log(`  ✅ Found ${statusByNormalizedName.size} riders with PCS DNF/DNS status at ${url}`);
+        // Debug: show what we found for specific riders
+        for (const [key, entry] of statusByNormalizedName) {
+          if (entry.name.includes('DEBRUYNE') || entry.name.includes('BERCKMOES')) {
+            console.log(`    📊 Final: ${entry.name} - status=${entry.status}, stage_number=${entry.stage_number}`);
+          }
+        }
         return statusByNormalizedName;
       }
     } catch (err) {
@@ -1954,6 +1994,7 @@ module.exports = {
   scrapePcsRiderStatusWithStage,
   resolvePcsRaceSlug,
   scrapeRiderUciPoints,
+  resolvePcsStageProfileImageUrls,
   resolveStageProfileImageUrls,
   supabase,
 };
