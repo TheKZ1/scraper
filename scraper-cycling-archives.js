@@ -1349,10 +1349,16 @@ const scrapePcsStartlist = async (race) => {
           if (/\bDNF\b/.test(rowText)) status = 'DNF';
           else if (/\bDNS\b/.test(rowText)) status = 'DNS';
 
+          // Check for youth classification (asterisk = competes for youth GC)
+          // PCS marks youth riders with * after the rider link: <a>name</a>*
+          const liHtml = $riderLi.html() || '';
+          const hasYouthAsterisk = /a[^>]*href[^>]*>\s*[^<]*\*/.test(liHtml) || rowText.includes(name + '*');
+
           riders.push({
             name,
             team: teamName,
             status,
+            youth_eligible: hasYouthAsterisk,
             rider_url: riderUrl || null
           });
         });
@@ -1566,7 +1572,79 @@ const scrapePcsRiderStatusWithStage = async (race) => {
 
       const $ = cheerio.load(html);
 
-      // Parse rider status: look for .dropout elements which contain text like "(DNF #15)" or "(DNS #7)"
+      // First pass: Parse all riders from startlist table to detect youth classification
+      $('table tbody tr').each((rowIdx, row) => {
+        const $row = $(row);
+        const rowHtml = $row.html() || '';
+        const rowText = $row.text().trim();
+        
+        // Look for rider links
+        const riderLink = $row.find('a[href*="/rider/"]').first();
+        if (riderLink.length === 0) return;
+        
+        const riderName = riderLink.text().trim();
+        if (!riderName || riderName.length < 2) return;
+        
+        const key = normalizeRiderLookupName(riderName);
+        if (!key) return;
+        
+        // Detect youth classification (U23, Young Rider badge, or specific styling)
+        // PCS marks youth riders with an asterisk (*) = competes for youth GC
+        // Multiple detection strategies:
+        
+        // 1. Primary: Check for asterisk immediately after the rider link
+        //    Pattern: </a>* in the HTML or riderLink.next() = "*"
+        let hasYouthAsterisk = false;
+        const linkHtml = riderLink.parent().html() || '';
+        if (/a[^>]*href[^>]*>\s*[^<]*\*/.test(linkHtml)) {
+          hasYouthAsterisk = true;
+        }
+        
+        // 2. Check for asterisk in the row text near rider name
+        if (!hasYouthAsterisk && rowText.includes(riderName + '*')) {
+          hasYouthAsterisk = true;
+        }
+        
+        // 3. Look for U23 text in the row
+        const hasU23Text = /\bU23\b/i.test(rowText);
+        
+        // 4. Check for class attributes containing u23, youth, young, or similar
+        const hasYouthClass = $row.find('[class*="u23"], [class*="youth"], [class*="young"], [class*="u23-rider"], [class*="young-rider"]').length > 0;
+        
+        // 5. Look for spans or elements near the rider name that might indicate youth
+        let hasYouthBadge = false;
+        $row.find('span, div, a').each((idx, el) => {
+          const $el = $(el);
+          const elText = $el.text().trim();
+          const elClass = $el.attr('class') || '';
+          if (/\bU23\b|young.rider|younger/i.test(elText) || /u23|youth|young/i.test(elClass)) {
+            hasYouthBadge = true;
+            return false; // break
+          }
+        });
+        
+        const isYouth = hasYouthAsterisk || hasU23Text || hasYouthClass || hasYouthBadge;
+        
+        // Ensure we have an entry for this rider
+        let existing = statusByNormalizedName.get(key);
+        if (!existing) {
+          existing = {
+            name: riderName,
+            status: null,
+            stage_number: null,
+            youth_eligible: isYouth,
+            source: 'pcs'
+          };
+          statusByNormalizedName.set(key, existing);
+        } else {
+          // Update youth status if not already set
+          if (isYouth) {
+            existing.youth_eligible = true;
+          }
+        }
+      });
+
+      // Second pass: Parse rider status (DNF/DNS) - look for .dropout elements
       $('body').find('[class*="dropout"]').each((idx, el) => {
         const $el = $(el);
         const elementText = $el.text().trim();
@@ -1617,11 +1695,13 @@ const scrapePcsRiderStatusWithStage = async (race) => {
       });
 
       if (statusByNormalizedName.size > 0) {
-        console.log(`  ✅ Found ${statusByNormalizedName.size} riders with PCS DNF/DNS status at ${url}`);
+        const youthCount = Array.from(statusByNormalizedName.values()).filter(r => r.youth_eligible).length;
+        console.log(`  ✅ Found ${statusByNormalizedName.size} riders with PCS data at ${url} (${youthCount} youth)`);
         // Debug: show what we found for specific riders
         for (const [key, entry] of statusByNormalizedName) {
-          if (entry.name.includes('DEBRUYNE') || entry.name.includes('BERCKMOES')) {
-            console.log(`    📊 Final: ${entry.name} - status=${entry.status}, stage_number=${entry.stage_number}`);
+          if (entry.name.includes('DEBRUYNE') || entry.name.includes('BERCKMOES') || entry.youth_eligible) {
+            const youthMark = entry.youth_eligible ? ' [U23]' : '';
+            console.log(`    📊 Final: ${entry.name} - status=${entry.status}, stage_number=${entry.stage_number}${youthMark}`);
           }
         }
         return statusByNormalizedName;
@@ -1850,7 +1930,8 @@ async function insertRaceData(race, raceData, riders) {
 
     // Scrape rider status (DNF/DNS) from PCS only.
     const pcsRiderStatusByName = await scrapePcsRiderStatusWithStage(race);
-    console.log(`  Found ${pcsRiderStatusByName.size} riders with PCS DNF/DNS status`);
+    const youthRiderCount = Array.from(pcsRiderStatusByName.values()).filter(r => r.youth_eligible).length;
+    console.log(`  Found ${pcsRiderStatusByName.size} riders with PCS data (${youthRiderCount} youth/U23)`);
     const riderDnfStageColumnsSupported = await hasRiderDnfStageColumns();
     const riderYouthColumnSupported = await hasRiderYouthColumn();
     const scrapeDetectedAt = new Date().toISOString();
@@ -1886,6 +1967,7 @@ async function insertRaceData(race, raceData, riders) {
       });
 
     if (ridersToInsert.length > 0) {
+      const youthInsertCount = ridersToInsert.filter(r => r.youth_eligible).length;
       const { error: ridersInsertError } = await supabase
         .from('riders')
         .insert(ridersToInsert);
@@ -1893,7 +1975,7 @@ async function insertRaceData(race, raceData, riders) {
       if (ridersInsertError) {
         console.log(`  ⚠️  Error inserting riders: ${ridersInsertError.message}`);
       } else {
-        console.log(`  ✅ Inserted ${ridersToInsert.length} riders`);
+        console.log(`  ✅ Inserted ${ridersToInsert.length} riders${youthInsertCount > 0 ? ` (${youthInsertCount} youth)` : ''}`);
       }
     } else {
       console.log('  ℹ️  No new riders to insert');
