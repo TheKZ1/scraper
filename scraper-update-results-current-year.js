@@ -569,6 +569,7 @@ async function fetchHtml(url) {
   } catch (err) {
     const status = Number(err && err.response && err.response.status);
     const isFirstCycling = String(url || '').includes('firstcycling.com');
+    console.log(`  ⚠️  Fetch error for ${url}: status=${status}, message=${err.message}`);
     if (status !== 403 || !isFirstCycling) {
       throw err;
     }
@@ -817,7 +818,8 @@ async function scrapePcsRaceClassificationResults(race, isOneDayRace) {
     };
   }
 
-  const slug = await resolvePcsRaceSlug(race);
+  let slug = await resolvePcsRaceSlug(race);
+  slug = correctPcsSlug(slug);
   const year = Number(race.year || TARGET_YEAR);
   if (!slug || !Number.isFinite(year)) {
     return {
@@ -1020,7 +1022,8 @@ async function scrapePcsStageWinner(race, stageNumber) {
     return { winner: null, sourceUrl: null };
   }
 
-  const slug = await resolvePcsRaceSlug(race);
+  let slug = await resolvePcsRaceSlug(race);
+  slug = correctPcsSlug(slug);
   const year = Number(race.year || TARGET_YEAR);
   const stage = Number(stageNumber);
   if (!slug || !Number.isFinite(year)) {
@@ -1077,7 +1080,8 @@ async function scrapePcsStageClassifications(race, stageNumber) {
     };
   }
 
-  const slug = await resolvePcsRaceSlug(race);
+  let slug = await resolvePcsRaceSlug(race);
+  slug = correctPcsSlug(slug);
   const year = Number(race.year || TARGET_YEAR);
   const stage = Number(stageNumber);
   if (!slug || !Number.isFinite(year)) {
@@ -1161,7 +1165,8 @@ async function scrapePcsOneDayRaceWinner(race) {
     return { winner: null, sourceUrl: null };
   }
 
-  const slug = await resolvePcsRaceSlug(race);
+  let slug = await resolvePcsRaceSlug(race);
+  slug = correctPcsSlug(slug);
   const year = Number(race.year || TARGET_YEAR);
   if (!slug || !Number.isFinite(year)) {
     return { winner: null, sourceUrl: null };
@@ -1227,6 +1232,23 @@ const CATEGORY_LABEL_BY_RESULT_TYPE = {
   MOUNTAIN_WINNER: 'KOM',
   YOUTH_WINNER: 'Pogi Trui',
   LOWEST_GC_FINISHER: 'Rode Lantaarn',
+};
+
+// Known slug corrections for races where the database name doesn't match PCS slug
+const PCS_SLUG_CORRECTIONS = {
+  'vuelta-ciclista-a-espana': 'vuelta-a-espana',
+  'vuelta ciclista a espana': 'vuelta-a-espana',
+  'la-vuelta-ciclista-a-espana': 'vuelta-a-espana',
+  'la vuelta ciclista a espana': 'vuelta-a-espana',
+  'volta ciclista a catalunya': 'volta-a-catalunya',
+  'bretagne-classic-cic': 'bretagne-classic',
+};
+
+const correctPcsSlug = (slug) => {
+  if (!slug) return slug;
+  const slugKey = slug.toLowerCase().replace(/\s+/g, '-');
+  const corrected = PCS_SLUG_CORRECTIONS[slugKey];
+  return corrected || slug;
 };
 
 function getRequiredResultTypes(isOneDayRace) {
@@ -1348,7 +1370,8 @@ async function detectPcsStageNumberOffset(nonRestStages, race) {
     return 0;
   }
 
-  const slug = await resolvePcsRaceSlug(race);
+  let slug = await resolvePcsRaceSlug(race);
+  slug = correctPcsSlug(slug);
   const year = Number(race.year || TARGET_YEAR);
   if (!slug || !Number.isFinite(year)) {
     return 0;
@@ -1510,31 +1533,35 @@ async function main() {
     const resolvedStageWinners = new Map();
     for (const stage of startedStages) {
       const scrapedStageNumber = Math.max(0, Number(stage.stage_number) + stageNumberOffset);
-      const { winner, sourceUrl } = await scrapeStageWinner(stage, scrapedStageNumber, race);
-      const classifications = await scrapePcsStageClassifications(race, scrapedStageNumber);
-      const existingWinner = normalizeCompareName(stage.winner);
-      const scrapedWinner = normalizeCompareName(winner);
-      const resolvedWinner = winner || stage.winner || null;
+      try {
+        const { winner, sourceUrl } = await scrapeStageWinner(stage, scrapedStageNumber, race);
+        const classifications = await scrapePcsStageClassifications(race, scrapedStageNumber);
+        const existingWinner = normalizeCompareName(stage.winner);
+        const scrapedWinner = normalizeCompareName(winner);
+        const resolvedWinner = winner || stage.winner || null;
 
-      if (resolvedWinner) {
-        resolvedStageWinners.set(String(stage.id), resolvedWinner);
+        if (resolvedWinner) {
+          resolvedStageWinners.set(String(stage.id), resolvedWinner);
+        }
+
+        if (winner && existingWinner !== scrapedWinner || classifications.gc_leader) {
+          await updateStageResults(stage.id, winner, classifications);
+          updatedStages += 1;
+        }
+
+        if (!fallbackRaceWinner && winner) {
+          fallbackRaceWinner = winner;
+        }
+
+        const mappingLabel = scrapedStageNumber !== Number(stage.stage_number)
+          ? ` [from s=${scrapedStageNumber}]`
+          : '';
+        console.log(`  Stage ${stage.stage_number}${mappingLabel}: ${winner || 'not found'}${sourceUrl ? ` (${sourceUrl})` : ''}`);
+        console.log(`    GC: ${classifications.gc_leader || 'N/A'}, Points: ${classifications.points_leader || 'N/A'}, Youth: ${classifications.youth_leader || 'N/A'}, KOM: ${classifications.kom_leader || 'N/A'}, Lanterne: ${classifications.lanterne_rouge || 'N/A'}`);
+        await sleep(1500);
+      } catch (stageErr) {
+        console.log(`  ❌ Stage ${stage.stage_number}: Error during scraping - ${stageErr.message}`);
       }
-
-      if (winner && existingWinner !== scrapedWinner || classifications.gc_leader) {
-        await updateStageResults(stage.id, winner, classifications);
-        updatedStages += 1;
-      }
-
-      if (!fallbackRaceWinner && winner) {
-        fallbackRaceWinner = winner;
-      }
-
-      const mappingLabel = scrapedStageNumber !== Number(stage.stage_number)
-        ? ` [from s=${scrapedStageNumber}]`
-        : '';
-      console.log(`  Stage ${stage.stage_number}${mappingLabel}: ${winner || 'not found'}${sourceUrl ? ` (${sourceUrl})` : ''}`);
-      console.log(`    GC: ${classifications.gc_leader || 'N/A'}, Points: ${classifications.points_leader || 'N/A'}, Youth: ${classifications.youth_leader || 'N/A'}, KOM: ${classifications.kom_leader || 'N/A'}, Lanterne: ${classifications.lanterne_rouge || 'N/A'}`);
-      await sleep(1500);
     }
 
     let allStageWinnersKnown = nonRestStages.length > 0
